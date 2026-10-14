@@ -3,6 +3,7 @@
 
 use eframe::egui::{self, Align, Color32, FontId, Id, Layout, Margin, Order, Rect, RichText, ScrollArea, Sense, Stroke, Ui, pos2, vec2};
 use minnamate_core::doc::{Cap, ColorTransform, Element, Instance, Join, Loop, Paint, Rgba, SymbolKind, TextAlign, Tween};
+use minnamate_core::filters::{Blend, CACHE_AS_BITMAP, EXPORT_AS_BITMAP};
 use minnamate_core::{fonts, hit};
 
 use crate::app::{Action, Editor, PanelId, PropsTab, rgba};
@@ -301,7 +302,7 @@ struct DocToggles {
     scale_content: bool,
 }
 
-fn color32(c: Rgba) -> Color32 {
+pub(crate) fn color32(c: Rgba) -> Color32 {
     let [r, g, b, a] = c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
     Color32::from_rgba_unmultiplied(r, g, b, a)
 }
@@ -447,8 +448,8 @@ fn tool_props(ui: &mut Ui, ed: &mut Editor) {
     };
     if fill || stroke {
         let shown = Shown {
-            fill: fill.then_some(ed.fill_color),
-            stroke: stroke.then_some(ed.stroke_color),
+            fill: fill.then(|| ed.fill()),
+            stroke: stroke.then(|| ed.stroke().paint),
             width: ed.stroke_width,
             cap: ed.stroke_cap,
             join: ed.stroke_join,
@@ -469,10 +470,10 @@ fn tool_props(ui: &mut Ui, ed: &mut Editor) {
     }
 }
 
-/// What Color and Style shows: the colours (None hides the row) and the stroke settings.
+/// What Color and Style shows: the paints (None hides the row) and the stroke settings.
 struct Shown {
-    fill: Option<Color32>,
-    stroke: Option<Color32>,
+    fill: Option<Paint>,
+    stroke: Option<Paint>,
     width: f32,
     cap: Cap,
     join: Join,
@@ -483,19 +484,20 @@ struct Shown {
 /// to the drawing defaults and the selected shapes.
 fn color_and_style(ui: &mut Ui, ed: &mut Editor, s: Shown) {
     theme::section(ui, "Color and Style", |ui| {
-        for (name, color, is_fill) in [("Fill", s.fill, true), ("Stroke", s.stroke, false)] {
-            let Some(c) = color else { continue };
+        for (name, paint, is_fill) in [("Fill", &s.fill, true), ("Stroke", &s.stroke, false)] {
+            let Some(paint) = paint else { continue };
+            let c = color::solid(paint);
             let style = |c: Color32| if is_fill { Style::Fill(c) } else { Style::Stroke(c) };
             widgets::row(ui, |ui| {
-                let chip = widgets::chip(ui, c, &format!("{name} color"));
-                if let Some(picked) = color::swatch_popup(ui, ed, &chip, c, true) {
-                    color::restyle(ed, style(picked));
-                }
+                let chip = color::paint_chip(ui, paint, &format!("{name} color"));
+                color::paint_popup(ui, ed, &chip, paint, is_fill);
                 widgets::label(ui, name, 50.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let mut a = (c.a() as f32 / 2.55).round();
                     let label = format!("{name} alpha");
-                    let r = ui.add_enabled(!widgets::is_none(c), Number::new(&label, &mut a, 0.0..=100.0).suffix(" %").width(44.0));
+                    // A gradient's alpha is its stops', which the Color panel edits.
+                    let solid = !widgets::is_none(c) && !matches!(paint, Paint::Gradient(_));
+                    let r = ui.add_enabled(solid, Number::new(&label, &mut a, 0.0..=100.0).suffix(" %").width(44.0));
                     if r.changed() {
                         let [cr, cg, cb, _] = c.to_srgba_unmultiplied();
                         color::restyle(ed, style(Color32::from_rgba_unmultiplied(cr, cg, cb, (a * 2.55).round() as u8)));
@@ -677,6 +679,7 @@ fn object_props(ui: &mut Ui, ed: &mut Editor) {
             header(ui, Icon::Text, crate::text_tool::kind_name(t.kind), None);
             position_size(ui, ed);
             text_props(ui, ed);
+            crate::filters::section(ui, ed, sel[0]);
         }
         [Some(Element::Group(_))] => {
             header(ui, Icon::Group, "Group", None);
@@ -701,6 +704,8 @@ fn position_size(ui: &mut Ui, ed: &mut Editor) {
     let Some(b) = hit::bounds(&ed.doc, ed.timeline(), ed.frame, &ed.selection) else { return };
     let origin = match ed.selection.as_slice() {
         [r] => match ed.element(*r) {
+            // A motion tween's target, where it shows now.
+            Some(Element::Instance(_)) if let Some(Element::Instance(i)) = crate::tweens::shown_target(ed, *r) => (i.matrix.tx, i.matrix.ty),
             Some(Element::Instance(i)) => (i.matrix.tx, i.matrix.ty),
             _ => b.min,
         },
@@ -769,14 +774,10 @@ fn shape_props(ui: &mut Ui, ed: &mut Editor) {
         widgets::quick(ui, Icon::CreateBrush, false, false, "Create Brush");
     });
     position_size(ui, ed);
-    let solid = |p: &Paint| match p {
-        Paint::Solid(c) => color32(*c),
-        Paint::Unsupported { .. } => Color32::GRAY,
-    };
     let stroke = shape.strokes.first();
     let shown = Shown {
-        fill: shape.fills.first().map(solid),
-        stroke: stroke.map(|s| solid(&s.paint)),
+        fill: shape.fills.first().cloned(),
+        stroke: stroke.map(|s| s.paint.clone()),
         width: stroke.map_or(ed.stroke_width, |s| s.width),
         cap: stroke.map_or(ed.stroke_cap, |s| s.cap),
         join: stroke.map_or(ed.stroke_join, |s| s.join),
@@ -1037,9 +1038,7 @@ fn color_effect(ui: &mut Ui, ed: &mut Editor, r: hit::ElementRef, c: ColorTransf
         let start = if e == Effect::Advanced { c } else { ColorTransform::IDENTITY };
         if start != c {
             ed.checkpoint();
-            if let Some(Element::Instance(i)) = ed.element_mut(r) {
-                i.color = start;
-            }
+            crate::tweens::set_color(ed, r, start);
         }
         ui.data_mut(|d| d.insert_temp(id, (whose, e, tint)));
         return;
@@ -1047,9 +1046,7 @@ fn color_effect(ui: &mut Ui, ed: &mut Editor, r: hit::ElementRef, c: ColorTransf
     ui.data_mut(|d| d.insert_temp(id, (whose, effect, tint)));
     if next != c {
         ed.checkpoint_gesture("color-effect");
-        if let Some(Element::Instance(i)) = ed.element_mut(r) {
-            i.color = next;
-        }
+        crate::tweens::set_color(ed, r, next);
     }
     if done {
         ed.end_gesture();
@@ -1113,17 +1110,20 @@ fn instance_props(ui: &mut Ui, ed: &mut Editor, r: hit::ElementRef) {
         }
     });
     position_size(ui, ed);
-    color_effect(ui, ed, r, inst.color);
+    // A motion tween's target shows the effect keyed where the playhead is.
+    let shown = crate::tweens::shown_target(ed, r).and_then(|el| if let Element::Instance(i) = el { Some(i.color) } else { None });
+    color_effect(ui, ed, r, shown.unwrap_or(inst.color));
     if inst.kind == SymbolKind::Graphic {
         looping(ui, ed, r, &inst);
     } else {
         display(ui, ed, r, &inst);
+        crate::filters::section(ui, ed, r);
     }
 }
 
 /// Display (movie clips and buttons): Visible, Blending and Render, kept in the
-/// instance's XFL attributes.
-// ponytail: saved, not yet drawn: the stage and the SWF ignore blend modes and bitmap caching.
+/// instance's XFL attributes, which minnamate_core::filters draws and publishes.
+// ponytail: no Transparent / Opaque background choice once Render caches.
 fn display(ui: &mut Ui, ed: &mut Editor, r: hit::ElementRef, inst: &Instance) {
     let attr = |ed: &mut Editor, name: &'static str, value: Option<&str>| {
         ed.checkpoint();
@@ -1140,27 +1140,11 @@ fn display(ui: &mut Ui, ed: &mut Editor, r: hit::ElementRef, inst: &Instance) {
         });
         widgets::row(ui, |ui| {
             widgets::label(ui, "Blending", WORD_W);
-            const MODES: [(&str, &str); 14] = [
-                ("normal", "Normal"),
-                ("layer", "Layer"),
-                ("darken", "Darken"),
-                ("multiply", "Multiply"),
-                ("lighten", "Lighten"),
-                ("screen", "Screen"),
-                ("overlay", "Overlay"),
-                ("hardlight", "Hard Light"),
-                ("add", "Add"),
-                ("subtract", "Subtract"),
-                ("difference", "Difference"),
-                ("invert", "Invert"),
-                ("alpha", "Alpha"),
-                ("erase", "Erase"),
-            ];
             let current = inst.extra.get("blendMode").unwrap_or("normal");
-            let shown = MODES.iter().find(|m| m.0 == current).map_or("Normal", |m| m.1);
+            let shown = Blend::ALL.iter().find(|m| m.1 == current).map_or("Normal", |m| m.2);
             let mut picked = None;
             widgets::dropdown(ui, "Blending", shown, ui.available_width() - 4.0, |ui| {
-                for (i, (value, text)) in MODES.into_iter().enumerate() {
+                for (i, (_, value, text)) in Blend::ALL.into_iter().enumerate() {
                     // Separators after Normal, Layer, Multiply, Screen, Hard Light and Difference.
                     if [2, 4, 6, 8, 11].contains(&i) || i == 1 {
                         ui.separator();
@@ -1176,10 +1160,16 @@ fn display(ui: &mut Ui, ed: &mut Editor, r: hit::ElementRef, inst: &Instance) {
         });
         widgets::row(ui, |ui| {
             widgets::label(ui, "Render", WORD_W);
-            let cached = inst.extra.get("cacheAsBitmap") == Some("true");
-            let renders = [(false, "Original (No Change)", true), (true, "Cache as Bitmap", true)];
-            if let Some(cache) = widgets::pick(ui, "Render", cached, &renders, ui.available_width() - 4.0) {
-                attr(ed, "cacheAsBitmap", cache.then_some("true"));
+            let modes = [CACHE_AS_BITMAP, EXPORT_AS_BITMAP];
+            let current = modes.iter().position(|&m| inst.extra.get(m) == Some("true")).map_or(0, |k| k + 1);
+            let renders = [(0, "Original (No Change)", true), (1, "Cache as Bitmap", true), (2, "Export as Bitmap", true)];
+            if let Some(picked) = widgets::pick(ui, "Render", current, &renders, ui.available_width() - 4.0) {
+                ed.checkpoint();
+                if let Some(Element::Instance(i)) = ed.element_mut(r) {
+                    for (k, mode) in modes.into_iter().enumerate() {
+                        i.extra.set(mode, (picked == k + 1).then_some("true"));
+                    }
+                }
             }
         });
     });
@@ -1247,9 +1237,11 @@ fn frame_props(ui: &mut Ui, ed: &mut Editor) {
         if widgets::quick(ui, Icon::TlClassicTween, false, can, "Create Classic Tween").clicked() {
             ed.run(Action::CreateClassicTween, ui.ctx());
         }
-        // ponytail: motion and shape tweens aren't modelled.
-        widgets::quick(ui, Icon::MotionTween, false, false, "Create Motion Tween");
-        widgets::quick(ui, Icon::ShapeTween, false, false, "Create Shape Tween");
+        for (icon, tip, action) in [(Icon::MotionTween, "Create Motion Tween", Action::CreateMotionTween), (Icon::ShapeTween, "Create Shape Tween", Action::CreateShapeTween)] {
+            if widgets::quick(ui, icon, false, crate::timeline::available(ed, action), tip).clicked() {
+                ed.run(action, ui.ctx());
+            }
+        }
     });
     let Some((k, key)) = key else {
         ui.add_space(8.0);
@@ -1262,6 +1254,9 @@ fn frame_props(ui: &mut Ui, ed: &mut Editor) {
     let label = key.label().map_or((String::new(), "name".to_string()), |(n, t)| (n.to_string(), t.to_string()));
     let (mut name, mut kind) = label.clone();
     let mut tween = key.tween.clone();
+    // Orient to path, kept as XFL's own frame attribute.
+    const ORIENT: &str = "motionTweenOrientToPath";
+    let mut orient = key.extra.get(ORIENT) == Some("true");
     let mut done_typing = false;
     // A tween field let go of: its edits end their undo step.
     let mut let_go = false;
@@ -1287,6 +1282,8 @@ fn frame_props(ui: &mut Ui, ed: &mut Editor) {
                 let what = if other == "shape" { "Shape tween".to_string() } else { format!("Motion tween ({other})") };
                 ui.label(RichText::new(what).color(theme::TEXT_DIM));
             }
+            Tween::Motion(m) => crate::tweens::motion_settings(ui, m, &mut let_go),
+            Tween::Shape { ease, angular, .. } => crate::tweens::shape_settings(ui, ease, angular, &mut let_go),
             Tween::Classic { ease, rotate } => {
                 widgets::row(ui, |ui| {
                     // ponytail: one ease for every property; easing them separately isn't modelled.
@@ -1326,9 +1323,14 @@ fn frame_props(ui: &mut Ui, ed: &mut Editor) {
                         _ => Rotate::Auto,
                     };
                 });
-                // ponytail: the classic tween model has ease and rotation only; the rest show their defaults.
+                // ponytail: the classic tween model has ease, rotation and Orient to path only; the rest
+                // show their defaults. Snap always holds: a guided tween runs from and to the guide.
+                widgets::row(ui, |ui| {
+                    ui.add_enabled_ui(false, |ui| ui.allocate_ui(vec2(120.0, 22.0), |ui| widgets::checkbox(ui, &mut true, "Snap")));
+                    ui.allocate_ui(vec2(120.0, 22.0), |ui| widgets::checkbox(ui, &mut orient, "Orient to path"));
+                });
                 ui.add_enabled_ui(false, |ui| {
-                    for pair in [[("Snap", true), ("Orient to path", false)], [("Color along path", false), ("Scale along path", false)], [("Sync", false), ("Scale", true)]] {
+                    for pair in [[("Color along path", false), ("Scale along path", false)], [("Sync", false), ("Scale", true)]] {
                         widgets::row(ui, |ui| {
                             for (text, mut on) in pair {
                                 ui.allocate_ui(vec2(120.0, 22.0), |ui| widgets::checkbox(ui, &mut on, text));
@@ -1374,6 +1376,10 @@ fn frame_props(ui: &mut Ui, ed: &mut Editor) {
     if tween != key.tween {
         ed.checkpoint_gesture("frame-tween");
         ed.timeline_mut().layers[l].frames[k].tween = tween;
+    }
+    if orient != (key.extra.get(ORIENT) == Some("true")) {
+        ed.checkpoint();
+        ed.timeline_mut().layers[l].frames[k].extra.set(ORIENT, orient.then_some("true"));
     }
     if let_go {
         ed.end_gesture();

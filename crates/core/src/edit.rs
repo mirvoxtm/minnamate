@@ -21,7 +21,12 @@ impl Layer {
         }
         match self.keyframe_at(f) {
             Some(i) => {
-                self.frames[i].duration += n;
+                let key = &mut self.frames[i];
+                key.duration += n;
+                // A motion tween's keyframes past `f` move along.
+                if let Tween::Motion(m) = &mut key.tween {
+                    m.insert_frames(f - key.index, n);
+                }
                 for k in &mut self.frames[i + 1..] {
                     k.index += n;
                 }
@@ -60,6 +65,12 @@ impl Layer {
         let cut = |a: u32, b: u32| b.min(end).saturating_sub(a.max(f));
         let had_frames = !self.frames.is_empty();
         for k in &mut self.frames {
+            // A motion tween's keyframes on the frames that go, go too.
+            if let Tween::Motion(m) = &mut k.tween
+                && cut(k.index, k.index + k.duration) > 0
+            {
+                m.remove_frames(f.saturating_sub(k.index), cut(k.index, k.index + k.duration), k.duration);
+            }
             k.duration -= cut(k.index, k.index + k.duration);
             k.index -= cut(0, k.index);
         }
@@ -89,9 +100,13 @@ impl Layer {
         }
     }
 
-    /// Remove Tween from the span holding `f`.
+    /// Remove Tween from the span holding `f`. A motion tween's target stays as the
+    /// span's first frame shows it.
     pub fn remove_tween(&mut self, f: u32) {
         if let Some(i) = self.keyframe_at(f) {
+            if let Some(el) = crate::motion::target_at(&self.frames[i], 0) {
+                self.frames[i].elements = vec![el];
+            }
             self.frames[i].tween = Tween::None;
         }
     }
@@ -112,6 +127,10 @@ impl Layer {
         }
         self.extend_to(f + n - 1);
         for at in f..f + n {
+            // Inside a motion tween, F6 keys its properties instead.
+            if !blank && self.key_motion(at) {
+                continue;
+            }
             self.split_at(at, !blank);
             if blank && let Some(k) = self.frames.iter_mut().find(|k| k.index == at) {
                 k.elements.clear();
@@ -141,11 +160,12 @@ impl Layer {
             if from >= to {
                 continue;
             }
+            let tween = crate::motion::copied(key, from - key.index, to - key.index);
             let mut k = if from == key.index {
-                key.clone()
+                Frame { tween, ..key.clone() }
             } else {
                 let elements = on_stage(key, self.frames.get(i + 1), from - key.index);
-                Frame { index: 0, duration: 0, tween: key.tween.clone(), elements, extra: carried_extra(&key.extra) }
+                Frame { index: 0, duration: 0, tween, elements, extra: carried_extra(&key.extra) }
             };
             (k.index, k.duration) = (from - f, to - from);
             clip.push(k);
@@ -211,6 +231,8 @@ impl Layer {
     /// Reverse Frames: mirrors the keyframes of frames f..f+n, which start and
     /// end with one, so they play backward and tweens run the other way. Each
     /// keyframe's hold mirrors too, so it now leads up to the keyframe.
+    // ponytail: a motion tween's property keyframes aren't mirrored inside its span, so its
+    // tween goes to the span mirrored before it as is. Mirror them (rebased) if that bites.
     pub fn reverse_frames(&mut self, f: u32, n: u32) {
         if !self.can_reverse(f, n) {
             return;
@@ -262,6 +284,10 @@ impl Layer {
     /// F6 and F7: splits a keyframe off at `f`, holding what is on stage there if `copy`.
     fn split(&mut self, f: u32, copy: bool) -> u32 {
         let at = if self.frames.iter().any(|k| k.index == f) { f + 1 } else { f };
+        // Inside a motion tween (or just past one), F6 keys its properties instead.
+        if copy && self.key_motion(at) {
+            return at;
+        }
         self.extend_to(at);
         self.split_at(at, copy);
         at
@@ -270,20 +296,24 @@ impl Layer {
     /// Starts a keyframe at `at` by splitting the span holding it; the new
     /// keyframe holds what is on stage there if `copy`, else nothing. Where a
     /// keyframe starts already, or past the layer's end, nothing changes.
-    fn split_at(&mut self, at: u32, copy: bool) {
+    pub(crate) fn split_at(&mut self, at: u32, copy: bool) {
         let Some(i) = self.keyframe_at(at) else { return };
         let key = &self.frames[i];
         let offset = at - key.index;
         if offset == 0 {
             return;
         }
-        let new = Frame {
+        let mut new = Frame {
             index: at,
             duration: key.duration - offset,
             tween: if copy { key.tween.clone() } else { Tween::None },
             elements: if copy { on_stage(key, self.frames.get(i + 1), offset) } else { Vec::new() },
-            extra: if copy { carried_extra(&key.extra) } else { Extra::default() },
+            extra: if copy { carried_extra(&key.extra) } else { crate::layer_tree::rig_link(&key.extra) },
         };
+        // A motion tween's keyframes go with the frames they're on.
+        if let Some(tail) = crate::motion::split(&mut self.frames[i], offset).filter(|_| copy) {
+            new.tween = Tween::Motion(Box::new(tail));
+        }
         self.frames[i].duration = offset;
         self.frames.insert(i + 1, new);
     }
@@ -299,8 +329,7 @@ impl Timeline {
     }
 
     /// New Folder: inserts an empty folder at `at`, as `insert_layer` does.
-    // ponytail: folders don't hold layers yet (the editor can't nest them); new ones get no
-    // children, and the timeline shows loaded folders' children flat under them.
+    /// `Timeline::adopt` puts it in the folder it lands in.
     pub fn insert_folder(&mut self, at: usize, name: &str) -> usize {
         self.insert_layers(at, vec![Layer { name: name.into(), kind: LayerKind::Folder, frames: Vec::new(), extra: Extra::default() }])
     }
@@ -337,18 +366,26 @@ impl Timeline {
     /// Rebuilds the layer list: `order` says, top first, which old layer goes
     /// at each place, None taking the next of `new`. Each kept layer's XFL
     /// parentLayerIndex (its folder, or the mask over it) then follows that
-    /// layer, or goes with it; new layers get none.
-    // ponytail: a moved layer stays in its folder or under its mask wherever it lands;
-    // regroup by drop position when the timeline nests layers.
+    /// layer, or, if it's gone, the one that held it; new layers get none.
+    /// A moved layer stays in its folder or under its mask wherever it lands;
+    /// `Timeline::move_into` regroups by drop position.
     fn rearrange(&mut self, order: &[Option<usize>], new: Vec<Layer>) {
         const PARENT: &str = "parentLayerIndex";
+        let parents: Vec<Option<usize>> = self.layers.iter().map(|l| l.extra.get(PARENT).and_then(|p| p.parse().ok())).collect();
         let mut old: Vec<Option<Layer>> = self.layers.drain(..).map(Some).collect();
         let mut new = new.into_iter();
         self.layers = order.iter().filter_map(|o| o.map_or_else(|| new.next(), |i| old[i].take())).collect();
         let place = |p: usize| order.iter().position(|&o| o == Some(p));
         for (layer, o) in self.layers.iter_mut().zip(order) {
-            let parent = o.and(layer.extra.get(PARENT)).and_then(|p| p.parse().ok()).and_then(place);
-            layer.extra.set(PARENT, parent.map(|p| p.to_string()).as_deref());
+            // Up past removed layers, at most once round each (a file can loop them).
+            let mut parent = o.and_then(|i| parents[i]);
+            for _ in 0..parents.len() {
+                match parent {
+                    Some(p) if place(p).is_none() => parent = parents.get(p).copied().flatten(),
+                    _ => break,
+                }
+            }
+            layer.extra.set(PARENT, parent.and_then(place).map(|p| p.to_string()).as_deref());
         }
     }
 
@@ -386,9 +423,13 @@ impl Timeline {
 
 /// What `key`'s span shows `offset` frames in, as the contents of a keyframe there.
 pub(crate) fn on_stage(key: &Frame, next: Option<&Frame>, offset: u32) -> Vec<Element> {
-    // ponytail: shape and motion tweens copy the keyframe as is, which is how display.rs shows them too.
-    let mut elements = match tween_at(key, next, offset) {
-        Some(inst) => vec![Element::Instance(inst)],
+    // A tween's in-between: a classic or motion tween's target, or a shape tween's shapes.
+    let tweened = tween_at(key, next, offset)
+        .map(Element::Instance)
+        .or_else(|| crate::motion::target_at(key, offset))
+        .or_else(|| crate::shape_tween::at(key, next, offset).map(Element::Shape));
+    let mut elements = match tweened {
+        Some(el) => vec![el],
         None => key.elements.clone(),
     };
     play_on(&mut elements, offset);

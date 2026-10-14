@@ -15,6 +15,7 @@ use crate::doc::{
     self, Cap, ColorTransform, Document, Edge, Element, Extra, Frame, Instance, Join, Layer, LayerKind, Loop, Matrix,
     Paint, Point, Rotate, Seg, Shape, Stroke, Symbol, SymbolKind, Text, TextAlign, TextKind, TextRun, Timeline, Tween,
 };
+use crate::gradient::{Gradient, GradientKind, Spread};
 use crate::{text, xfl};
 
 /// Saves a `.fla` file when `path` ends in `.fla`, otherwise an XFL folder: `path`,
@@ -278,8 +279,33 @@ fn frame(x: &mut Xml, f: &Frame) {
                 attrs.extend([("motionTweenRotate", way.to_string()), ("motionTweenRotateTimes", n.to_string())]);
             }
         }
+        Tween::Shape { ease, angular, hints } => {
+            attrs.push(("tweenType", "shape".into()));
+            if *ease != 0.0 {
+                attrs.push(("acceleration", unscale(*ease, 100.0).to_string()));
+            }
+            if *angular {
+                attrs.push(("shapeTweenBlend", "angular".into()));
+            }
+            if !hints.is_empty() {
+                attrs.push(("shapeHints", crate::shape_tween::write_hints(hints)));
+            }
+        }
+        Tween::Motion(m) => {
+            attrs.push(("tweenType", "motion object".into()));
+            let turns = match m.rotate {
+                Rotate::Auto => None,
+                Rotate::Cw(n) => Some(("clockwise", n)),
+                Rotate::Ccw(n) => Some(("counter-clockwise", n)),
+            };
+            attrs.push(("motionTweenRotate", turns.map_or("none", |t| t.0).into()));
+            attrs.extend(turns.map(|(_, n)| ("motionTweenRotateTimes", n.to_string())));
+        }
     }
-    x.kept("DOMFrame", &attrs, &f.extra, xfl::frame_attrs(&f.tween), |x| {
+    // A motion tween's XML goes before its elements: as read while the tween is, else afresh.
+    let extra = crate::motion::saved_extra(f);
+    x.kept("DOMFrame", &attrs, &extra, xfl::frame_attrs(&f.tween), |x| {
+        crate::motion::write(x, f);
         x.el("elements", &[], |x| f.elements.iter().for_each(|el| element(x, el)));
     });
 }
@@ -406,8 +432,36 @@ fn paint(x: &mut Xml, p: &Paint) {
             attrs.extend(nums(&[("alpha", *a, 1.0)]));
             x.el("SolidColor", &attrs, |_| {});
         }
+        Paint::Gradient(g) => gradient(x, g),
         Paint::Unsupported { xml, .. } => x.raw(xml),
     }
+}
+
+fn gradient(x: &mut Xml, g: &Gradient) {
+    let (tag, focal) = match g.kind {
+        GradientKind::Linear => ("LinearGradient", 0.0),
+        GradientKind::Radial { focal } => ("RadialGradient", focal),
+    };
+    let spread = match g.spread {
+        Spread::Pad => None,
+        Spread::Reflect => Some("reflect"),
+        Spread::Repeat => Some("repeat"),
+    };
+    let mut attrs: Vec<_> = spread.map(|s| ("spreadMethod", s.to_string())).into_iter().collect();
+    if g.linear_rgb {
+        attrs.push(("interpolationMethod", "linearRGB".into()));
+    }
+    attrs.extend(nums(&[("focalPointRatio", focal, 0.0)]));
+    x.kept(tag, &attrs, &g.extra, xfl::GRADIENT_ATTRS, |x| {
+        matrix(x, &g.matrix);
+        for &(ratio, [r, gr, b, a]) in &g.stops {
+            let color = hex([r, gr, b]);
+            let mut attrs = if color == "#000000" { Vec::new() } else { vec![("color", color)] };
+            attrs.extend(nums(&[("alpha", a, 1.0)]));
+            attrs.push(("ratio", ratio.to_string()));
+            x.el("GradientEntry", &attrs, |_| {});
+        }
+    });
 }
 
 // ponytail: Edge attributes other than these, like Animate's `cubics` (the curves as
@@ -498,21 +552,21 @@ fn unscale(v: f32, k: f32) -> f32 {
     [x.round(), x, x.next_down(), x.next_up()].into_iter().find(|x| x / k == v).unwrap_or(x)
 }
 
-fn hex(rgb: [f32; 3]) -> String {
+pub(crate) fn hex(rgb: [f32; 3]) -> String {
     let [r, g, b] = rgb.map(|c| (c * 255.0).round() as u8);
     format!("#{r:02X}{g:02X}{b:02X}")
 }
 
 /// Indented XML text, written element by element.
 #[derive(Default)]
-struct Xml {
+pub(crate) struct Xml {
     text: String,
     depth: usize,
 }
 
 impl Xml {
     /// `<tag attrs>`, what `body` writes, `</tag>`; or `<tag attrs/>` if it writes nothing.
-    fn el(&mut self, tag: &str, attrs: &[(&str, String)], body: impl FnOnce(&mut Self)) {
+    pub(crate) fn el(&mut self, tag: &str, attrs: &[(&str, String)], body: impl FnOnce(&mut Self)) {
         self.indent();
         self.text.push('<');
         self.text.push_str(tag);
@@ -553,7 +607,7 @@ impl Xml {
     }
 
     /// XML from the source file, as it was.
-    fn raw(&mut self, xml: &str) {
+    pub(crate) fn raw(&mut self, xml: &str) {
         if !xml.is_empty() {
             self.indent();
             self.text.push_str(xml);
@@ -567,7 +621,7 @@ impl Xml {
 }
 
 /// Escapes an attribute value, tabs and line breaks too: XML would read those as spaces.
-fn escape(value: &str) -> String {
+pub(crate) fn escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
         match c {

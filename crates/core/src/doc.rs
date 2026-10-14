@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::ops::Mul;
 
+pub use crate::gradient::{Gradient, GradientKind, Spread};
+
 pub type Point = (f32, f32);
 /// Straight (not premultiplied) RGBA, each channel 0..=1.
 pub type Rgba = [f32; 4];
@@ -208,7 +210,13 @@ pub enum Tween {
     None,
     /// Classic tween to the next keyframe. `ease` runs -1 (in) ..= 1 (out).
     Classic { ease: f32, rotate: Rotate },
-    /// Shape and motion-object tweens, not modelled yet; the frame's `extra` keeps their settings.
+    /// Motion tween: the span moves its one target by property keyframes (motion.rs).
+    Motion(Box<crate::motion::Motion>),
+    /// Shape tween to the next keyframe (shape_tween.rs), `ease` as a classic tween's.
+    /// `angular` blends keeping corners and straight sides, else smoothly (Distributive).
+    /// `hints` (a, b, c...) pin a point of this keyframe's outlines to one of the next's.
+    Shape { ease: f32, angular: bool, hints: Vec<(Point, Point)> },
+    /// Other tween kinds, not modelled; the frame's `extra` keeps their settings.
     Unsupported(String),
 }
 
@@ -291,7 +299,9 @@ pub struct Shape {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Paint {
     Solid(Rgba),
-    /// Gradients and bitmap fills: the XFL element's name and its XML, saved back as is.
+    /// A linear or radial gradient (gradient.rs).
+    Gradient(Gradient),
+    /// Bitmap fills: the XFL element's name and its XML, saved back as is.
     Unsupported { name: String, xml: String },
 }
 

@@ -10,7 +10,7 @@ use eframe::egui::{
 };
 use minnamate_core::doc::{Document, Element, LayerKind, Matrix, Paint, Point, Rgba, Shape, Timeline};
 use minnamate_core::hit::{self, ElementRef};
-use minnamate_core::render::render_timeline;
+use minnamate_core::render::{render_layer, render_timeline};
 use minnamate_core::{arrange, draw, swf_export, symbols, transform, xfl, xfl_write};
 
 use crate::icons::Icon;
@@ -71,6 +71,15 @@ pub enum Action {
     ClearKeyframe,
     CreateClassicTween,
     RemoveTween,
+    CreateMotionTween,
+    CreateShapeTween,
+    /// Insert Keyframe and Clear Keyframe inside a motion tween: one property, or all.
+    InsertPropertyKeyframe(Option<minnamate_core::motion::Kind>),
+    ClearPropertyKeyframe(Option<minnamate_core::motion::Kind>),
+    SplitMotion,
+    /// Modify > Shape: a shape tween's hints.
+    AddShapeHint,
+    RemoveAllHints,
     ConvertToKeyframes,
     ConvertToBlankKeyframes,
     CutFrames,
@@ -92,6 +101,14 @@ pub enum Action {
     HideOthers,
     ToggleGuide,
     LayerProperties,
+    // The layer menu's masks, motion guides and folders.
+    ToggleMask,
+    ShowMasking,
+    AddMotionGuide,
+    ExpandFolders,
+    CollapseFolders,
+    ExpandAllFolders,
+    CollapseAllFolders,
     SelectAll,
     Deselect,
     DeleteSelection,
@@ -308,6 +325,9 @@ pub struct Editor {
     pub recent: Vec<PathBuf>,
     pub stroke_color: Color32,
     pub fill_color: Color32,
+    /// The fill and stroke as gradients (color.rs); None draws the solid colors above.
+    pub fill_gradient: Option<minnamate_core::doc::Gradient>,
+    pub stroke_gradient: Option<minnamate_core::doc::Gradient>,
     pub stroke_width: f32,
     pub stroke_cap: minnamate_core::doc::Cap,
     pub stroke_join: minnamate_core::doc::Join,
@@ -322,6 +342,7 @@ pub struct Editor {
     /// The stage gesture in progress, if any.
     pub drag: Option<crate::stage::Drag>,
     pub transform: crate::free_transform::State,
+    pub gradient_transform: crate::gradient_transform::State,
     pub pen: crate::pen::State,
     pub text: crate::text_tool::State,
     pub eraser: crate::eraser::State,
@@ -436,6 +457,8 @@ impl Editor {
             recent: load_recent(),
             stroke_color: Color32::BLACK,
             fill_color: Color32::from_rgb(0x00, 0x99, 0xFF),
+            fill_gradient: None,
+            stroke_gradient: None,
             stroke_width: 1.0,
             stroke_cap: minnamate_core::doc::Cap::Round,
             stroke_join: minnamate_core::doc::Join::Round,
@@ -447,6 +470,7 @@ impl Editor {
             selection: Vec::new(),
             drag: None,
             transform: Default::default(),
+            gradient_transform: Default::default(),
             pen: Default::default(),
             text: Default::default(),
             eraser: Default::default(),
@@ -671,11 +695,11 @@ impl Editor {
         self.selection = self.selection.iter().filter_map(|&r| Some(ElementRef { layer: row(r.layer)?, ..r })).collect();
     }
 
-    /// Whether drawing and pasting can land on the active layer: a normal or
-    /// guide layer, shown and unlocked.
+    /// Whether drawing and pasting can land on the active layer: a normal, guide
+    /// or mask layer, shown and unlocked.
     pub fn drawable(&self) -> bool {
         let layer = self.timeline().layers.get(self.layer);
-        layer.is_some_and(|l| matches!(l.kind, LayerKind::Normal | LayerKind::Guide) && l.visible() && !l.locked())
+        layer.is_some_and(|l| matches!(l.kind, LayerKind::Normal | LayerKind::Guide | LayerKind::Mask) && l.visible() && !l.locked())
     }
 
     pub fn element(&self, r: ElementRef) -> Option<&Element> {
@@ -692,10 +716,10 @@ impl Editor {
             return;
         }
         self.checkpoint_gesture(gesture);
+        // A motion tween's target, inside its span, gets a position keyframe instead.
+        let frame = self.frame;
         for r in self.selection.clone() {
-            if let Some(el) = self.element_mut(r) {
-                hit::translate(el, dx, dy);
-            }
+            minnamate_core::motion::edit_shown(self.timeline_mut(), r, frame, |el| hit::translate(el, dx, dy));
         }
     }
 
@@ -782,7 +806,8 @@ impl Editor {
                 let moves = arrange::align(&boxes.iter().map(|&(_, b)| b).collect::<Vec<_>>(), stage, how);
                 self.edit_timeline(|_, tl| {
                     for (&(r, _), m) in boxes.iter().zip(&moves) {
-                        tl.element_mut(r).into_iter().for_each(|el| transform::transform(el, m));
+                        // A motion tween's target, inside its span, gets keyframes instead.
+                        minnamate_core::motion::edit_shown(tl, r, frame, |el| transform::transform(el, m));
                     }
                     sel.clone()
                 });
@@ -805,7 +830,7 @@ impl Editor {
                     .collect();
                 self.edit_timeline(|_, tl| {
                     for &(r, p) in &fixed {
-                        tl.element_mut(r).into_iter().for_each(|el| transform::remove_transform(el, p));
+                        minnamate_core::motion::edit_shown(tl, r, frame, |el| transform::remove_transform(el, p));
                     }
                     sel.clone()
                 });
@@ -871,11 +896,12 @@ impl Editor {
     /// The stroke the drawing tools use now.
     pub fn stroke(&self) -> minnamate_core::doc::Stroke {
         use minnamate_core::doc::Stroke;
-        Stroke { width: self.stroke_width, paint: Paint::Solid(rgba(self.stroke_color)), cap: self.stroke_cap, join: self.stroke_join }
+        let paint = self.stroke_gradient.clone().map_or(Paint::Solid(rgba(self.stroke_color)), Paint::Gradient);
+        Stroke { width: self.stroke_width, paint, cap: self.stroke_cap, join: self.stroke_join }
     }
 
     pub fn fill(&self) -> Paint {
-        Paint::Solid(rgba(self.fill_color))
+        self.fill_gradient.clone().map_or(Paint::Solid(rgba(self.fill_color)), Paint::Gradient)
     }
 
     pub fn can_undo(&self) -> bool {
@@ -1142,6 +1168,7 @@ impl Editor {
         let color = timeline::next_color(tl);
         let at = tl.insert_layer(at, &name);
         tl.layers[at].set_color(color);
+        tl.adopt(at);
         self.layer = at;
         self.follow_layers(|l| Some(if l < at { l } else { l + 1 }));
     }
@@ -1272,6 +1299,10 @@ impl Editor {
             | Action::ClearKeyframe
             | Action::CreateClassicTween
             | Action::RemoveTween
+            | Action::CreateShapeTween
+            | Action::InsertPropertyKeyframe(_)
+            | Action::ClearPropertyKeyframe(_)
+            | Action::SplitMotion
             | Action::ConvertToKeyframes
             | Action::ConvertToBlankKeyframes
             | Action::PasteFrames
@@ -1291,7 +1322,17 @@ impl Editor {
             | Action::LockOthers
             | Action::HideOthers
             | Action::ToggleGuide
-            | Action::LayerProperties => timeline::command(self, action),
+            | Action::LayerProperties
+            | Action::ToggleMask
+            | Action::ShowMasking
+            | Action::AddMotionGuide
+            | Action::ExpandFolders
+            | Action::CollapseFolders
+            | Action::ExpandAllFolders
+            | Action::CollapseAllFolders => timeline::command(self, action),
+            // What can't be motion tweened as it is asks to be converted first.
+            Action::CreateMotionTween => crate::tweens::create_motion_tween(self, ctx),
+            Action::AddShapeHint | Action::RemoveAllHints => crate::tweens::hint_command(self, action),
             Action::CutFrames | Action::CopyFrames if timeline::available(self, action) => {
                 timeline::command(self, action);
                 // Ctrl+Alt+V only reaches us as egui-winit's Paste event, which needs text on the clipboard.
@@ -1571,9 +1612,10 @@ impl Editor {
         let key = hash((self.rev, self.scene, vp.bits()));
         let (doc, tl) = (&self.doc, timeline_of(&self.doc, self.scene, &self.editing));
         let matrix = vp.matrix * self.editing.last().map_or(Matrix::IDENTITY, |t| t.transform);
-        let one = Timeline { name: tl.name.clone(), layers: vec![tl.layers.get(layer)?.clone()], extra: Default::default() };
+        tl.layers.get(layer)?;
         cached(ctx, &mut self.onion_cache, (layer, frame, tint.map(|c| c.to_array())), key, || {
-            let (mut pixmap, _) = render_timeline(doc, &one, frame, &matrix, vp.size, 1.0).ok()?;
+            // Drawn from the whole timeline, so its mask, guide and parent still count.
+            let (mut pixmap, _) = render_layer(doc, tl, frame, layer, &matrix, vp.size, 1.0).ok()?;
             if let Some(tint) = tint {
                 // Mostly the tint, with a little of the original color left showing.
                 for px in pixmap.data_mut().chunks_exact_mut(4) {
@@ -1778,6 +1820,7 @@ impl eframe::App for Editor {
         });
         self.dialogs(&ctx);
         timeline::dialogs(&ctx, self);
+        crate::tweens::dialogs(&ctx, self);
         crate::test_movie::show(&ctx, self);
         crate::convert_symbol::show(&ctx, self);
         crate::arrange_panels::show(&ctx, self);

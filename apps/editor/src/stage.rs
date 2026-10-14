@@ -11,7 +11,7 @@ use minnamate_core::doc::{self, Element, Frame, Instance, Layer, LayerKind, Matr
 use minnamate_core::hit::{self, ElementRef, Grip};
 use minnamate_core::render::render_timeline;
 use minnamate_core::tiny_skia as sk;
-use minnamate_core::{display, draw, text};
+use minnamate_core::{draw, text};
 
 use crate::app::{Action, Editor, PropsTab, ViewPort, hash};
 use crate::cursors::{self, Cursor};
@@ -46,13 +46,14 @@ pub enum Drag {
     Lasso { points: Vec<Point> },
 }
 
-/// View > Rulers, Grid and Guides.
+/// View > Rulers, Grid, Guides and Show Shape Hints.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Toggle {
     Rulers,
     Grid,
     Guides,
     LockGuides,
+    ShapeHints,
 }
 
 /// A ruler guide, in stage pixels from the stage's top-left corner.
@@ -70,6 +71,7 @@ pub struct State {
     pub grid: bool,
     pub guides_shown: bool,
     pub guides_locked: bool,
+    pub shape_hints: bool,
     // ponytail: guides belong to the view, not the document, so they aren't saved or undone.
     // Animate keeps them in the document; move them there when the XFL writer learns them.
     pub guides: Vec<Guide>,
@@ -80,7 +82,7 @@ pub struct State {
 
 impl Default for State {
     fn default() -> Self {
-        State { rulers: false, grid: false, guides_shown: true, guides_locked: false, guides: Vec::new(), dragging: None }
+        State { rulers: false, grid: false, guides_shown: true, guides_locked: false, shape_hints: true, guides: Vec::new(), dragging: None }
     }
 }
 
@@ -91,6 +93,7 @@ impl State {
             Toggle::Grid => self.grid,
             Toggle::Guides => self.guides_shown,
             Toggle::LockGuides => self.guides_locked,
+            Toggle::ShapeHints => self.shape_hints,
         }
     }
 
@@ -100,6 +103,7 @@ impl State {
             Toggle::Grid => &mut self.grid,
             Toggle::Guides => &mut self.guides_shown,
             Toggle::LockGuides => &mut self.guides_locked,
+            Toggle::ShapeHints => &mut self.shape_hints,
         };
         *flag = !*flag;
     }
@@ -177,6 +181,7 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor) {
     if !hand && ed.tool != Tool::Zoom && ed.stage.dragging.is_none() {
         match ed.tool {
             Tool::FreeTransform => free_transform::input(ui, ed, &resp, stage),
+            Tool::GradientTransform => crate::gradient_transform::input(ui, ed, &resp, stage),
             Tool::Pen => pen::input(ui, ed, &resp, stage),
             Tool::Text => text_tool::input(ui, ed, &resp, stage),
             Tool::Eraser => eraser::input(ui, ed, &resp, stage),
@@ -249,6 +254,7 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor) {
     if let Some(tex) = dots(ed, &ctx, &vp) {
         art.image(tex, view, uv, Color32::WHITE);
     }
+    crate::tweens::paint(&p, ed, stage);
     highlights(&p, ed, stage);
     // What a shape drag will make, in its real stroke and fill.
     if let Some(Drag::Shape { start, end }) = ed.drag
@@ -262,6 +268,7 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor) {
     drag_feedback(&p, ed, stage);
     match ed.tool {
         Tool::FreeTransform => free_transform::overlay(&p, ed, stage),
+        Tool::GradientTransform => crate::gradient_transform::overlay(&p, ed, stage),
         Tool::Pen => pen::overlay(&p, ed, stage),
         Tool::Text => text_tool::overlay(&p, ed, stage),
         Tool::Eraser => eraser::overlay(&p, ed, stage),
@@ -269,7 +276,7 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor) {
         // The brush's tip, at its size and in the fill colour, is its pointer.
         Tool::Brush if !hand && ctx.output(|o| o.cursor_icon == CursorIcon::None) => {
             if let Some(pos) = pointer {
-                p.circle_filled(pos, (ed.brush_size * ed.zoom / 2.0).max(1.0), ed.fill_color);
+                p.circle_filled(pos, (ed.brush_size * ed.zoom / 2.0).max(1.0), crate::color::solid(&ed.fill()));
             }
         }
         _ => {}
@@ -286,6 +293,10 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor) {
 /// Selection, shape and stroke tools: click, drag and release on the stage.
 /// Other tools can fall back to it for selecting.
 pub fn tool_input(ui: &Ui, ed: &mut Editor, resp: &egui::Response, stage: Rect) {
+    // A drag on a selected target's motion path is the path's.
+    if crate::tweens::input(ui, ed, resp, stage) {
+        return;
+    }
     let (shift, alt) = ui.input(|i| (i.modifiers.shift, i.modifiers.alt));
     if resp.drag_started() {
         // Start where the button went down, not where the drag was recognized.
@@ -629,7 +640,8 @@ fn render_elements(ed: &Editor, elements: Vec<Element>, vp: &ViewPort) -> Option
 /// white pixel over a black one, inside exactly what the shapes draw.
 fn dots(ed: &mut Editor, ctx: &egui::Context, vp: &ViewPort) -> Option<egui::TextureId> {
     let raw: Vec<ElementRef> = ed.selection.iter().copied().filter(|&r| raw_shape(ed, r)).collect();
-    if raw.is_empty() {
+    // The Gradient Transform tool shows its handles over the fill instead.
+    if raw.is_empty() || ed.tool == Tool::GradientTransform {
         return None;
     }
     let ppp = ctx.pixels_per_point();
@@ -665,13 +677,9 @@ fn dots(ed: &mut Editor, ctx: &egui::Context, vp: &ViewPort) -> Option<egui::Tex
 }
 
 /// Instance `r` as it shows at the current frame: a classic tween moves it
-/// between its keyframes.
+/// between its keyframes (along a motion guide), and parenting after its parent.
 pub(crate) fn shown_instance(ed: &Editor, r: ElementRef) -> Option<Instance> {
-    let layer = ed.timeline().layers.get(r.layer)?;
-    let key = layer.frames.get(r.keyframe)?;
-    let Some(Element::Instance(inst)) = key.elements.get(r.element) else { return None };
-    let offset = ed.frame.checked_sub(key.index)?;
-    Some(display::tween_at(key, layer.frames.get(r.keyframe + 1), offset).unwrap_or_else(|| inst.clone()))
+    minnamate_core::layer_motion::shown_instance(ed.timeline(), r, ed.frame)
 }
 
 /// The Selection tool's look for every selected object but raw shapes (they
@@ -706,10 +714,12 @@ fn highlights(p: &Painter, ed: &Editor, stage: Rect) {
             Some(Element::Text(t)) => {
                 let layout = text::layout(t);
                 let (w, h) = (layout.width, layout.height);
-                p.add(egui::Shape::closed_line(quad(&t.matrix, (0.0, 0.0), (w, h)), line));
+                // Where it shows: a motion tween moves it.
+                let matrix = crate::tweens::shown_matrix(ed, r).unwrap_or(t.matrix);
+                p.add(egui::Shape::closed_line(quad(&matrix, (0.0, 0.0), (w, h)), line));
                 // Static text's handle is at the top right, dynamic and input text's at the bottom right:
                 // round while the box grows with its text, square once its width is set.
-                let corner = at(t.matrix.apply(if t.kind == TextKind::Static { (w, 0.0) } else { (w, h) }));
+                let corner = at(matrix.apply(if t.kind == TextKind::Static { (w, 0.0) } else { (w, h) }));
                 if t.width.is_some() {
                     p.rect(Rect::from_center_size(corner, vec2(5.0, 5.0)), 0.0, Color32::WHITE, line, StrokeKind::Middle);
                 } else {
@@ -769,9 +779,9 @@ fn drag_feedback(p: &Painter, ed: &Editor, stage: Rect) {
         Some(Drag::Stroke { points }) => {
             let pts: Vec<Pos2> = points.iter().map(|&q| to_screen(q)).collect();
             let stroke = if ed.tool == Tool::Brush {
-                Stroke::new(ed.brush_size * zoom, ed.fill_color)
+                Stroke::new(ed.brush_size * zoom, crate::color::solid(&ed.fill()))
             } else {
-                Stroke::new((ed.stroke_width * zoom).max(1.0), ed.stroke_color)
+                Stroke::new((ed.stroke_width * zoom).max(1.0), crate::color::solid(&ed.stroke().paint))
             };
             p.add(egui::Shape::line(pts, stroke));
         }
@@ -823,7 +833,8 @@ fn pointer_glyph(ctx: &egui::Context, ed: &Editor, resp: &egui::Response, stage:
         Tool::Pencil => return cursors::show(ctx, Cursor::Pencil),
         Tool::Selection => {
             let Some(pos) = resp.hover_pos() else { return };
-            return cursors::show(ctx, selection_badge(ed, local_point(ed, stage, pos), alt));
+            let badge = crate::tweens::cursor(ed, stage, pos).unwrap_or_else(|| selection_badge(ed, local_point(ed, stage, pos), alt));
+            return cursors::show(ctx, badge);
         }
         Tool::Text => CursorIcon::Text,
         Tool::Line | Tool::Rectangle | Tool::Oval | Tool::PolyStar | Tool::Pen => CursorIcon::Crosshair,

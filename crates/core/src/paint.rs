@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::display::display_list_shown;
+use crate::display::{display_list_shown, unmasked};
 use crate::doc::*;
 use crate::hit::{self, ElementRef};
 
@@ -17,15 +17,25 @@ pub enum Picked {
 }
 
 /// Eyedropper: the stroke or fill drawn at `point` on `frame` of `tl`, from
-/// inside symbols too. Strokes reach `tolerance` past their edges.
+/// inside symbols too. Strokes reach `tolerance` past their edges. A gradient
+/// comes with its matrix in `tl`'s coordinates, to paint on as it lies.
 // ponytail: colors come as the shape holds them, before instances' color effects (tint,
 // alpha). Carry display.rs's color transforms through `under` if picking tinted symbols matters.
 pub fn pick(doc: &Document, tl: &Timeline, frame: u32, point: Point, tolerance: f32) -> Option<Picked> {
-    under(doc, tl, frame, point, true).into_iter().find_map(|(_, s, p, scale)| {
+    under(doc, tl, frame, point, true).into_iter().find_map(|(_, s, p, scale, m)| {
         let g = Graph::new(s, 0.0);
+        let placed = |mut paint: Paint| {
+            if let Paint::Gradient(g) = &mut paint {
+                g.matrix = m * g.matrix;
+            }
+            paint
+        };
         Some(match g.seen(s, p, tolerance * scale)? {
-            Seen::Stroke(i) => Picked::Stroke(style(&s.strokes, g.pieces[i].styles[STROKE])?.clone()),
-            Seen::Fill(face) => Picked::Fill(style(&s.fills, g.fill(&face))?.clone()),
+            Seen::Stroke(i) => {
+                let stroke = style(&s.strokes, g.pieces[i].styles[STROKE])?;
+                Picked::Stroke(Stroke { paint: placed(stroke.paint.clone()), ..stroke.clone() })
+            }
+            Seen::Fill(face) => Picked::Fill(placed(style(&s.fills, g.fill(&face))?.clone())),
         })
     })
 }
@@ -54,9 +64,29 @@ pub fn area_fill(doc: &Document, tl: &Timeline, frame: u32, point: Point, gap: f
     Some(style(&s.fills, g.fill(&face)).cloned())
 }
 
+/// The box around the area `bucket` would fill at `point`, in its shape's
+/// coordinates, and the shape's matrix: what a gradient poured there spans.
+pub fn area_box(doc: &Document, tl: &Timeline, frame: u32, point: Point, gap: f32) -> Option<(hit::Rect, Matrix)> {
+    let (_, s, g, face) = target(doc, tl, frame, point, gap)?;
+    let points = face.iter().flat_map(|&h| &g.pieces[h / 2].points);
+    let b = points.map(|&p| hit::Rect { min: p, max: p }).reduce(hit::Rect::union)?;
+    Some((b, s.matrix))
+}
+
+/// The Gradient Transform tool's target at `point`: a shape element of `tl`
+/// drawn there and the fill style (counted from 1) of its area there. An
+/// unfilled area shows what's under it.
+pub fn fill_at(doc: &Document, tl: &Timeline, frame: u32, point: Point) -> Option<(ElementRef, u32)> {
+    let found = under(doc, tl, frame, point, false).into_iter().find_map(|(r, s, p, _, _)| {
+        let g = Graph::new(s, 0.0);
+        Some((r, g.fill(&g.face_at(p)?))).filter(|&(_, fill)| fill != 0)
+    });
+    found.filter(|&(r, _)| is_shape(tl, r))
+}
+
 /// The shape element `bucket` acts on at `point`, and the face there.
 fn target<'a>(doc: &'a Document, tl: &'a Timeline, frame: u32, point: Point, gap: f32) -> Option<(ElementRef, &'a Shape, Graph, Vec<usize>)> {
-    let found = under(doc, tl, frame, point, false).into_iter().find_map(|(r, s, p, scale)| {
+    let found = under(doc, tl, frame, point, false).into_iter().find_map(|(r, s, p, scale, _)| {
         let g = Graph::new(s, gap * scale);
         let face = g.face_at(p)?;
         Some((r, s, g, face))
@@ -67,14 +97,18 @@ fn target<'a>(doc: &'a Document, tl: &'a Timeline, frame: u32, point: Point, gap
 /// Ink Bottle: gives the stroke at `point` on `frame` of `tl` the style `stroke`,
 /// all of it that runs on in the same style, or outlines the filled region there.
 /// Strokes reach `tolerance` past their edges. Returns the element to change and
-/// its new shape; None if nothing changes. Groups and symbols are left alone.
-pub fn ink(doc: &Document, tl: &Timeline, frame: u32, point: Point, tolerance: f32, stroke: Stroke) -> Option<(ElementRef, Shape)> {
-    let found = under(doc, tl, frame, point, false).into_iter().find_map(|(r, s, p, scale)| {
+/// its new shape; None if nothing changes. Groups and symbols are left alone. A
+/// gradient stroke spans the shape.
+pub fn ink(doc: &Document, tl: &Timeline, frame: u32, point: Point, tolerance: f32, mut stroke: Stroke) -> Option<(ElementRef, Shape)> {
+    let found = under(doc, tl, frame, point, false).into_iter().find_map(|(r, s, p, scale, _)| {
         let g = Graph::new(s, 0.0);
         let seen = g.seen(s, p, tolerance * scale)?;
         Some((r, s, g, seen))
     });
     let (r, s, g, seen) = found.filter(|&(r, ..)| is_shape(tl, r))?;
+    if let (Paint::Gradient(gradient), Some(b)) = (&mut stroke.paint, crate::gradient::edge_box(s)) {
+        gradient.fit(b);
+    }
     let pieces = match seen {
         Seen::Stroke(i) => g.connected(i),
         Seen::Fill(face) => face.iter().map(|&h| h / 2).collect(),
@@ -87,18 +121,19 @@ pub fn ink(doc: &Document, tl: &Timeline, frame: u32, point: Point, tolerance: f
 }
 
 /// The shapes drawn at `frame` of `tl`, topmost first: each with the element of
-/// `tl` that put it there, `point` in the shape's coordinates, and how long one
-/// of `tl`'s units is there. Hidden layers draw none; locked ones are passed
-/// over, as the stage can't change them, unless `locked` (the Eyedropper only reads).
-fn under<'a>(doc: &'a Document, tl: &'a Timeline, frame: u32, point: Point, locked: bool) -> Vec<(ElementRef, &'a Shape, Point, f32)> {
+/// `tl` that put it there, `point` in the shape's coordinates, how long one of
+/// `tl`'s units is there, and the matrix from the shape to `tl`. Hidden layers
+/// draw none; locked ones are passed over, as the stage can't change them,
+/// unless `locked` (the Eyedropper only reads).
+fn under<'a>(doc: &'a Document, tl: &'a Timeline, frame: u32, point: Point, locked: bool) -> Vec<(ElementRef, &'a Shape, Point, f32, Matrix)> {
     let mut found = Vec::new();
-    let shown = display_list_shown(doc, tl, frame, &mut BTreeSet::new());
+    let shown = unmasked(display_list_shown(doc, tl, frame, &mut BTreeSet::new()));
     for placed in shown.iter().rev().filter(|p| locked || !tl.layers[p.source.layer].locked()) {
         for (s, m) in hit::shapes(doc, &placed.item, placed.matrix, 0).into_iter().rev() {
             // Text hits as its box, which isn't paint.
             let std::borrow::Cow::Borrowed(s) = s else { continue };
             if let Some(inverse) = m.inverse() {
-                found.push((placed.source, s, inverse.apply(point), 1.0 / (m.a * m.d - m.b * m.c).abs().sqrt()));
+                found.push((placed.source, s, inverse.apply(point), 1.0 / (m.a * m.d - m.b * m.c).abs().sqrt(), m));
             }
         }
     }
@@ -696,6 +731,38 @@ mod tests {
         // Editing the symbol, its timeline's own shape takes paint, in its own coordinates.
         let (r, s) = bucket(&d, &d.library["Box"].timeline, 0, (5.0, 5.0), 0.0, solid(RED)).expect("the symbol's shape");
         assert_eq!((r, s.fills), (ElementRef { layer: 0, keyframe: 0, element: 0 }, vec![solid(RED)]));
+    }
+
+    #[test]
+    fn gradients_span_the_shape_or_area_they_go_to() {
+        let linear = Paint::Gradient(Gradient::new(GradientKind::Linear));
+        let mut square = draw::rectangle([(10.0, 10.0), (50.0, 30.0)], 0.0, None, Some(linear.clone()));
+        let Paint::Gradient(fitted) = &square.fills[0] else { panic!("not a gradient") };
+        assert_eq!(fitted.matrix, Matrix { a: 40.0 / 1638.4, d: 20.0 / 1638.4, tx: 30.0, ty: 20.0, ..Matrix::IDENTITY }, "drawn: across its box");
+        square.matrix = Matrix::translate(5.0, 0.0);
+        let mut d = shapes(vec![square.clone()]);
+        let r = ElementRef { layer: 0, keyframe: 0, element: 0 };
+        assert_eq!(fill_at(&d, &d.scenes[0], 0, (40.0, 20.0)), Some((r, 1)));
+        assert_eq!(fill_at(&d, &d.scenes[0], 0, (12.0, 20.0)), None, "outside, the shape having moved");
+        // The Eyedropper hands the gradient over where it lies on stage.
+        let Some(Picked::Fill(Paint::Gradient(picked))) = pick(&d, &d.scenes[0], 0, (40.0, 20.0), 0.0) else { panic!("no gradient") };
+        assert_eq!(picked.matrix, Matrix::translate(5.0, 0.0) * fitted.matrix);
+        // The bucket's area, in the shape's own coordinates.
+        let (b, m) = area_box(&d, &d.scenes[0], 0, (40.0, 20.0), 0.0).unwrap();
+        assert_eq!((b, m), (hit::Rect { min: (10.0, 10.0), max: (50.0, 30.0) }, square.matrix));
+        // The Ink Bottle's gradient spans the shape it outlines.
+        let stroke = Stroke { paint: linear, ..line(2.0, BLACK) };
+        assert!(restroke(&mut d, (40.0, 20.0), 0.0, stroke));
+        assert_eq!(gradient_of(&shape(&d, 0).strokes[0].paint).matrix, fitted.matrix);
+        // An outline drawn over it, unfilled, leaves its fill to take.
+        let outline = draw::rectangle([(20.0, 12.0), (48.0, 28.0)], 0.0, Some(line(1.0, BLACK)), None);
+        d.scenes[0].layers[0].frames[0].elements.push(Element::Shape(outline));
+        assert_eq!(fill_at(&d, &d.scenes[0], 0, (40.0, 20.0)), Some((r, 1)));
+    }
+
+    fn gradient_of(p: &Paint) -> &Gradient {
+        let Paint::Gradient(g) = p else { panic!("{p:?}") };
+        g
     }
 
     #[test]

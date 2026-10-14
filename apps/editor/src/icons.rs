@@ -143,6 +143,10 @@ pub enum Icon {
     TlEyeSlash,
     TlLock,
     TlOutlineBar,
+    /// Layer type icons: a mask, a guide, a motion guide (a guide with layers under it).
+    LayerMask,
+    LayerGuide,
+    LayerMotionGuide,
     // Home screen quick-start tiles (drawn about 72 px across).
     HomeFullHd,
     HomeGamepad,
@@ -198,6 +202,9 @@ pub enum Icon {
     Tag,
     // Document Settings.
     Link,
+    // The Filters section's header.
+    Plus,
+    Gear,
 }
 
 /// A gamepad's outline, for Home's Android tile and New Document's Game tab.
@@ -511,6 +518,10 @@ fn parts(icon: Icon) -> Vec<Part> {
         Icon::TlEyeSlash => vec![Line("M1.5 9 C4 5 7 4 9 4 C11 4 14 5 16.5 9 C14 13 11 14 9 14 C7 14 4 13 1.5 9 Z M2.5 2.5 L15.5 15.5", 1.2), Dot(9.0, 9.0, 2.2)],
         Icon::TlLock => vec![Fill("M4.5 8 H13.5 V16 H4.5 Z M8.3 10.5 H9.7 V13.5 H8.3 Z"), Line("M6.4 8 V5.8 C6.4 2.6 11.6 2.6 11.6 5.8 V8", 1.5)],
         Icon::TlOutlineBar => vec![Line("M6 3 H12 V15 H6 Z", 2.0)],
+        // A sheet with a round hole; a T-square with its marks; a curved path between two dots.
+        Icon::LayerMask => vec![Fill("M4 2.5 H14 Q15.5 2.5 15.5 4 V14 Q15.5 15.5 14 15.5 H4 Q2.5 15.5 2.5 14 V4 Q2.5 2.5 4 2.5 Z M9 5.4 C11 5.4 12.6 7 12.6 9 C12.6 11 11 12.6 9 12.6 C7 12.6 5.4 11 5.4 9 C5.4 7 7 5.4 9 5.4 Z")],
+        Icon::LayerGuide => vec![Line("M2.5 3.5 H15.5 M9 3.5 V15.5", 1.4), Line("M9 7.5 H11.5 M9 10.5 H11.5 M9 13.5 H11.5", 1.0)],
+        Icon::LayerMotionGuide => vec![Line("M3.5 14.5 C4.5 7 12 11.5 14.5 3.5", 1.3), Dot(3.5, 14.5, 1.8), Dot(14.5, 3.5, 1.8)],
         // Large glyphs keep Animate's 1.5 px lines: 0.38 units at 72 px, 0.8 at 30 px.
         Icon::HomeFullHd => vec![Line("M1.6 4 H16.4 Q17 4 17 4.6 V13.4 Q17 14 16.4 14 H1.6 Q1 14 1 13.4 V4.6 Q1 4 1.6 4 Z M7.6 6.6 L11.4 9 L7.6 11.4 Z", 0.38)],
         Icon::HomeGamepad => vec![
@@ -632,6 +643,12 @@ fn parts(icon: Icon) -> Vec<Part> {
         Icon::NewLibrary => vec![Line("M2.5 6 H11.5 V15.5 H2.5 Z M6.5 6 V2.5 H15.5 V11.5 H11.5", 1.2)],
         Icon::FolderOpen => vec![Line("M2 13.5 V4 H7 L8.5 5.5 H14.5 V7.5", 1.1), Fill("M4.6 8.5 H17 L14 14.5 H1.6 Z")],
         Icon::Tag => vec![Line("M2.5 2.5 H9 L15.5 9 L9 15.5 L2.5 9 Z", 1.2), Dot(6.0, 6.0, 1.2)],
+        Icon::Plus => vec![Line("M9 3.5 V14.5 M3.5 9 H14.5", 1.3)],
+        // A ring with eight rounded teeth.
+        Icon::Gear => vec![
+            Ring(9.0, 9.0, 4.4, 2.2),
+            Line("M9 3.2 V1.8 M9 14.8 V16.2 M3.2 9 H1.8 M14.8 9 H16.2 M4.9 4.9 L3.9 3.9 M13.1 13.1 L14.1 14.1 M4.9 13.1 L3.9 14.1 M13.1 4.9 L14.1 3.9", 2.4),
+        ],
     }
 }
 
@@ -847,6 +864,7 @@ mod tests {
         Icon::TlParenting, Icon::TlLayerDepth, Icon::TlKeyframe, Icon::TlBlankKeyframe, Icon::TlFrame, Icon::TlOnion,
         Icon::TlEditMultiple, Icon::TlClassicTween, Icon::TlCenterFrame, Icon::TlLoop, Icon::TlStepBack, Icon::TlStepForward,
         Icon::TlResetZoom, Icon::TlMountains, Icon::TlLayerView, Icon::TlEyeSlash, Icon::TlLock, Icon::TlOutlineBar,
+        Icon::LayerMask, Icon::LayerGuide, Icon::LayerMotionGuide,
         Icon::HomeFullHd, Icon::HomeGamepad, Icon::HomeBanner, Icon::HomeTablet, Icon::HomeCanvas, Icon::HomeMore,
         Icon::NdCharacter, Icon::NdSocial, Icon::NdGame, Icon::NdEducation, Icon::NdAds, Icon::NdWeb, Icon::NdAdvanced,
         Icon::NdPreset, Icon::NdCanvas, Icon::NdActionScript, Icon::Link, Icon::Magnet, Icon::SnapAlign, Icon::Rulers,
@@ -854,6 +872,7 @@ mod tests {
         Icon::PlayOnce, Icon::SingleFrame, Icon::ReversePlayOnce, Icon::ReverseLoop, Icon::Unlink, Icon::LinesToFills, Icon::Group,
         Icon::BreakApart, Icon::ConvertToSymbol, Icon::CreateBrush, Icon::Shape, Icon::Frame,
         Icon::Actions, Icon::MotionTween, Icon::ShapeTween, Icon::Sliders, Icon::AlignLeft, Icon::AlignCenter, Icon::AlignRight, Icon::AlignJustify, Icon::Pin, Icon::NewLibrary, Icon::FolderOpen, Icon::Tag,
+        Icon::Plus, Icon::Gear,
     ];
 
     #[test]

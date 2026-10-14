@@ -15,7 +15,8 @@ use crate::widgets;
 #[derive(Default)]
 pub struct State {
     pub gap: Gap,
-    /// Animate's Lock Fill: it only matters for gradient and bitmap fills, which can't be made yet.
+    /// Animate's Lock Fill: a gradient keeps the place the last fill gave it,
+    /// rather than spanning each area filled.
     pub lock_fill: bool,
     /// Animate's "Fill all regions": a drag fills every area it crosses, not
     /// only those filled like the one it started in.
@@ -121,9 +122,26 @@ fn gap(ed: &Editor) -> f32 {
     ed.paint.gap.pixels() / ed.zoom
 }
 
-/// Paint Bucket at `p`, as part of the press's undo step.
+/// Paint Bucket at `p`, as part of the press's undo step. A gradient spans the
+/// area it fills, or with Lock Fill lies where the last fill (or the Eyedropper)
+/// left it, so areas filled one after another show one gradient.
 fn fill(ed: &mut Editor, p: Point) {
-    if let Some((r, shape)) = paint::bucket(&ed.doc, ed.timeline(), ed.frame, p, gap(ed), ed.fill()) {
+    let mut paint = ed.fill();
+    if let Paint::Gradient(g) = &mut paint
+        && let Some((area, m)) = paint::area_box(&ed.doc, ed.timeline(), ed.frame, p, gap(ed))
+    {
+        if ed.paint.lock_fill
+            && let Some(inverse) = m.inverse()
+        {
+            g.matrix = inverse * g.matrix;
+        } else {
+            g.fit(area);
+            if let Some(default) = &mut ed.fill_gradient {
+                default.matrix = m * g.matrix;
+            }
+        }
+    }
+    if let Some((r, shape)) = paint::bucket(&ed.doc, ed.timeline(), ed.frame, p, gap(ed), paint) {
         ed.checkpoint_gesture("paint-bucket");
         if let Some(el) = ed.element_mut(r) {
             *el = Element::Shape(shape);
@@ -137,12 +155,17 @@ fn fill(ed: &mut Editor, p: Point) {
 fn eyedrop(ed: &mut Editor, picked: Picked) {
     match picked {
         Picked::Fill(Paint::Solid(c)) => {
-            (ed.fill_color, ed.paint.lock_fill, ed.tool) = (color32(c), true, Tool::PaintBucket);
+            (ed.fill_color, ed.fill_gradient, ed.paint.lock_fill, ed.tool) = (color32(c), None, true, Tool::PaintBucket);
         }
+        // Lock Fill on, the bucket carries the gradient on from where it was picked.
+        Picked::Fill(Paint::Gradient(g)) => (ed.fill_gradient, ed.paint.lock_fill, ed.tool) = (Some(g), true, Tool::PaintBucket),
         Picked::Stroke(Stroke { paint: Paint::Solid(c), width, .. }) => {
-            (ed.stroke_color, ed.stroke_width, ed.tool) = (color32(c), width, Tool::InkBottle);
+            (ed.stroke_color, ed.stroke_gradient, ed.stroke_width, ed.tool) = (color32(c), None, width, Tool::InkBottle);
         }
-        _ => ed.log("The Eyedropper can only pick solid colors for now."),
+        Picked::Stroke(Stroke { paint: Paint::Gradient(g), width, .. }) => {
+            (ed.stroke_gradient, ed.stroke_width, ed.tool) = (Some(g), width, Tool::InkBottle);
+        }
+        _ => ed.log("The Eyedropper can't pick bitmap fills yet."),
     }
 }
 
@@ -340,6 +363,55 @@ mod tests {
         h.state_mut().paint.fill_all = true;
         mouse_path(&mut h, &[(75.0, 75.0), (175.0, 75.0), (275.0, 75.0)]);
         assert_eq!(fills(&h), [RED, RED, RED]);
+    }
+
+    #[test]
+    fn gradients_pour_into_each_area_or_lock_across_them() {
+        use minnamate_core::doc::{Gradient, GradientKind, Matrix};
+        let mut h = blank();
+        h.state_mut().tool = Tool::Rectangle;
+        mouse_drag(&mut h, (100.0, 100.0), (200.0, 150.0));
+        mouse_drag(&mut h, (300.0, 100.0), (400.0, 200.0));
+        let gradient = |h: &Harness<'_, Editor>, i: usize| -> Gradient {
+            match &h.state().timeline().layers[0].frames[0].elements[i] {
+                Element::Shape(s) => match &s.fills[0] {
+                    Paint::Gradient(g) => g.clone(),
+                    other => panic!("{other:?}"),
+                },
+                other => panic!("{other:?}"),
+            }
+        };
+        let fit = |(x0, y0): (f32, f32), (x1, y1): (f32, f32)| {
+            let mut g = Gradient::new(GradientKind::Linear);
+            g.fit(minnamate_core::hit::Rect { min: (x0, y0), max: (x1, y1) });
+            g.matrix
+        };
+        // Each area takes the gradient across itself.
+        (h.state_mut().tool, h.state_mut().fill_gradient) = (Tool::PaintBucket, Some(Gradient::new(GradientKind::Linear)));
+        mouse_click(&mut h, (150.0, 125.0));
+        mouse_click(&mut h, (350.0, 150.0));
+        assert_eq!((gradient(&h, 0).matrix, gradient(&h, 1).matrix), (fit((100.0, 100.0), (200.0, 150.0)), fit((300.0, 100.0), (400.0, 200.0))));
+        // With Lock Fill, where the last fill left it: one gradient across both.
+        h.state_mut().paint.lock_fill = true;
+        mouse_click(&mut h, (150.0, 125.0));
+        assert_eq!(gradient(&h, 0).matrix, gradient(&h, 1).matrix);
+
+        // The Eyedropper picks a gradient up where it lies on stage (both shapes moved), for the bucket to go on with.
+        let ctx = h.ctx.clone();
+        h.state_mut().run(crate::app::Action::SelectAll, &ctx);
+        h.state_mut().nudge(10.0, 0.0, "test");
+        (h.state_mut().tool, h.state_mut().fill_gradient, h.state_mut().paint.lock_fill) = (Tool::Eyedropper, None, false);
+        mouse_click(&mut h, (360.0, 150.0));
+        let ed = h.state();
+        assert_eq!((ed.tool, ed.paint.lock_fill), (Tool::PaintBucket, true));
+        assert_eq!(ed.fill_gradient.as_ref().map(|g| g.matrix), Some(Matrix::translate(10.0, 0.0) * gradient(&h, 1).matrix));
+
+        // The Ink Bottle's gradient spans the shape it outlines.
+        (h.state_mut().tool, h.state_mut().stroke_gradient) = (Tool::InkBottle, Some(Gradient::new(GradientKind::Linear)));
+        mouse_click(&mut h, (110.0, 100.0));
+        let Element::Shape(s) = &h.state().timeline().layers[0].frames[0].elements[0] else { panic!("not a shape") };
+        let Paint::Gradient(stroke) = &s.strokes[0].paint else { panic!("{:?}", s.strokes) };
+        assert_eq!(stroke.matrix, fit((100.0, 100.0), (200.0, 150.0)));
     }
 
     #[test]

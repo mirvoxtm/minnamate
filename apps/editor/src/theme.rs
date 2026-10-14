@@ -114,6 +114,9 @@ pub const CHECKBOX_BORDER: Color32 = rgb(0x9A9A9A);
 pub const CHECKBOX_ON: Color32 = rgb(0xC8C8C8);
 /// Slider knobs: hollow rings.
 pub const SLIDER_KNOB: Color32 = rgb(0xE0E0E0);
+/// A filter's card in the Filters section: a little darker than the panel, outlined.
+pub const FILTER_CARD: Color32 = rgb(0x2B2B2B);
+pub const FILTER_CARD_BORDER: Color32 = rgb(0x474747);
 /// The red diagonal of "no color".
 pub const NO_COLOR_SLASH: Color32 = rgb(0xE0302A);
 /// Outline colors Animate gives layers as they're added (Layer_1 is cyan),

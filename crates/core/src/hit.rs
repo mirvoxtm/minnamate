@@ -5,7 +5,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 
-use crate::display::{Item, display_list, display_list_shown};
+use crate::display::{Item, display_list, display_list_shown, unmasked};
 use crate::doc::*;
 use crate::text;
 
@@ -40,7 +40,7 @@ impl Rect {
 /// classic tween this is the tween's first keyframe, hit where it's drawn.
 /// Hidden and locked layers are passed over, as the stage can't select them.
 pub fn hit_test(doc: &Document, tl: &Timeline, frame: u32, point: Point, tolerance: f32) -> Option<ElementRef> {
-    display_list_shown(doc, tl, frame, &mut BTreeSet::new())
+    unmasked(display_list_shown(doc, tl, frame, &mut BTreeSet::new()))
         .iter()
         .rev()
         .filter(|p| !tl.layers[p.source.layer].locked())
@@ -49,7 +49,8 @@ pub fn hit_test(doc: &Document, tl: &Timeline, frame: u32, point: Point, toleran
 }
 
 /// The box around what `elements` draw at `frame`, in `tl`'s coordinates and
-/// with strokes included. None if none of them is on stage then.
+/// with strokes included. None if none of them is on stage then: the editor's
+/// stage, where guides and unlocked masks show and hidden layers don't.
 pub fn bounds(doc: &Document, tl: &Timeline, frame: u32, elements: &[ElementRef]) -> Option<Rect> {
     bounds_through(doc, tl, frame, elements, Matrix::IDENTITY)
 }
@@ -57,7 +58,7 @@ pub fn bounds(doc: &Document, tl: &Timeline, frame: u32, elements: &[ElementRef]
 /// Like [`bounds`], in the coordinates `view` maps `tl`'s into. Through an
 /// element's inverse matrix, that is the box around it in its own coordinates.
 pub fn bounds_through(doc: &Document, tl: &Timeline, frame: u32, elements: &[ElementRef], view: Matrix) -> Option<Rect> {
-    display_list(doc, tl, frame, &mut BTreeSet::new())
+    unmasked(display_list_shown(doc, tl, frame, &mut BTreeSet::new()))
         .iter()
         .filter(|p| elements.contains(&p.source))
         .flat_map(|p| shapes(doc, &p.item, view * p.matrix, 0))
@@ -293,6 +294,10 @@ pub(crate) fn shapes<'a>(doc: &'a Document, item: &Item<'a>, m: Matrix, depth: u
             .flat_map(|p| shapes(doc, &p.item, m * p.matrix, depth + 1))
             .collect(),
         Item::Clip(..) => Vec::new(),
+        Item::Morph(ref s) => vec![(Cow::Owned((**s).clone()), m)],
+        // ponytail: what a mask hides still hits, and counts toward bounds. The stage locks masked
+        // layers while it shows the masking, so only clips and graphics holding masks are off.
+        Item::Masked { ref content, .. } => content.iter().flat_map(|p| shapes(doc, &p.item, m * p.matrix, depth)).collect(),
     }
 }
 
@@ -368,7 +373,7 @@ pub(crate) fn distance(p: Point, a: Point, b: Point) -> f32 {
 }
 
 /// From `p` to the segment `ab`, and how far along `ab` (0..=1) its nearest point is.
-fn along(p: Point, a: Point, b: Point) -> (f32, f32) {
+pub(crate) fn along(p: Point, a: Point, b: Point) -> (f32, f32) {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     let len2 = dx * dx + dy * dy;
     let t = if len2 > 0.0 { (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
@@ -463,8 +468,10 @@ mod tests {
         assert_eq!(hit(&d, 10.0), Some(el(1, 0, 0)));
         assert_eq!(hit(&d, 30.0), Some(el(1, 0, 1)), "later elements are on top");
         assert_eq!(hit(&d, 60.0), Some(el(0, 0, 0)), "upper layers are on top");
+        // A guide is on the stage while its timeline is edited (and so can be picked), but never publishes.
         d.scenes[0].layers[0].kind = LayerKind::Guide;
-        assert_eq!(hit(&d, 60.0), Some(el(1, 0, 1)), "guides aren't on stage");
+        assert_eq!(hit(&d, 60.0), Some(el(0, 0, 0)), "guides are on the stage being edited");
+        assert!(display_list(&d, &d.scenes[0], 0, &mut BTreeSet::new()).iter().all(|p| p.source.layer != 0), "but don't publish");
     }
 
     #[test]

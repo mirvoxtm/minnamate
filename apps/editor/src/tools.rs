@@ -243,7 +243,6 @@ impl Tool {
         !matches!(
             self,
             Subselection
-                | GradientTransform
                 | Polygon
                 | MagicWand
                 | FluidBrush
@@ -348,6 +347,7 @@ pub fn select(ed: &mut Editor, tool: Tool) {
 /// D: a black stroke and a white fill.
 fn black_and_white(ed: &mut Editor) {
     (ed.stroke_color, ed.fill_color) = (Color32::BLACK, Color32::WHITE);
+    (ed.stroke_gradient, ed.fill_gradient) = (None, None);
 }
 
 /// "No color": a fully transparent color shows as the swatch with the red slash.
@@ -355,11 +355,16 @@ fn no_color(c: Color32) -> bool {
     c.a() == 0
 }
 
-/// X: stroke and fill change places; not while either is "no color".
+/// X: stroke and fill change places, gradients too; not while either is "no color".
 fn swap_colors(ed: &mut Editor) {
-    if !no_color(ed.stroke_color) && !no_color(ed.fill_color) {
+    if swappable(ed) {
         std::mem::swap(&mut ed.stroke_color, &mut ed.fill_color);
+        std::mem::swap(&mut ed.stroke_gradient, &mut ed.fill_gradient);
     }
+}
+
+fn swappable(ed: &Editor) -> bool {
+    (ed.stroke_gradient.is_some() || !no_color(ed.stroke_color)) && (ed.fill_gradient.is_some() || !no_color(ed.fill_color))
 }
 
 /// Tool keys, then D, X and J. egui ignores extra Shift and Alt when matching,
@@ -765,7 +770,7 @@ fn colors(ui: &mut Ui, ed: &mut Editor, more: Rect) {
     if small_button(ui, bw, "black-and-white", "Black and White (D)", true).clicked() {
         black_and_white(ed);
     }
-    let swappable = !no_color(ed.stroke_color) && !no_color(ed.fill_color);
+    let swappable = swappable(ed);
     if small_button(ui, swap, "swap-colors", "Swap Colors (X)", swappable).clicked() {
         swap_colors(ed);
     }
@@ -785,27 +790,30 @@ fn colors(ui: &mut Ui, ed: &mut Editor, more: Rect) {
     let stroke_resp = ui.interact(stroke, Id::new("stroke-swatch"), Sense::click());
     let fill_resp = ui.interact(fill, Id::new("fill-swatch"), Sense::click());
     let p = ui.painter();
-    swatch(p, stroke, ed.stroke_color, true);
-    swatch(p, fill, ed.fill_color, false);
+    swatch(p, stroke, ed.stroke_color, ed.stroke_gradient.as_ref(), true);
+    swatch(p, fill, ed.fill_color, ed.fill_gradient.as_ref(), false);
     // The swatch popup, as from Properties: a pick sets the tool color and recolors the selection.
     for (resp, fill, label) in [(stroke_resp, false, "Stroke color"), (fill_resp, true, "Fill color")] {
         resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("Tools {}", label.to_lowercase())));
-        let current = if fill { ed.fill_color } else { ed.stroke_color };
-        if let Some(c) = crate::color::swatch_popup(ui, ed, &resp, current, true) {
-            crate::color::restyle(ed, if fill { crate::color::Style::Fill(c) } else { crate::color::Style::Stroke(c) });
-        }
+        let paint = if fill { ed.fill() } else { ed.stroke().paint };
+        crate::color::paint_popup(ui, ed, &resp, &paint, fill);
         resp.on_hover_text(label);
     }
 }
 
 /// A 22×22 swatch, 1 px black then 1 px white around it. The fill is a
-/// square of color; the stroke a 2 px band of it around a dark hole. "No
-/// color" is white, with a red slash.
-fn swatch(p: &Painter, r: Rect, color: Color32, ring: bool) {
-    let none = no_color(color);
+/// square of color, or of its gradient; the stroke a 2 px band of it around a
+/// dark hole. "No color" is white, with a red slash.
+fn swatch(p: &Painter, r: Rect, color: Color32, gradient: Option<&minnamate_core::doc::Gradient>, ring: bool) {
+    let none = no_color(color) && gradient.is_none();
     p.rect_filled(r, 0.0, Color32::BLACK);
     p.rect_filled(r.shrink(1.0), 0.0, Color32::WHITE);
-    p.rect_filled(r.shrink(2.0), 0.0, if none { Color32::WHITE } else { color.to_opaque() });
+    match gradient {
+        Some(g) => crate::color::paint_gradient(p, r.shrink(2.0), g, false),
+        None => {
+            p.rect_filled(r.shrink(2.0), 0.0, if none { Color32::WHITE } else { color.to_opaque() });
+        }
+    }
     if none {
         p.with_clip_rect(r.shrink(1.0)).line_segment([r.left_bottom(), r.right_top()], Stroke::new(2.0, theme::NO_COLOR));
     }

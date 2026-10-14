@@ -199,10 +199,10 @@ pub fn resize(ed: &mut Editor, b: hit::Rect, w: f32, h: f32) {
 
 /// Transforms every selected element by `m`. Callers checkpoint first.
 fn transform_selection(ed: &mut Editor, m: &Matrix) {
+    // A motion tween's target, inside its span, gets property keyframes instead.
+    let frame = ed.frame;
     for r in ed.selection.clone() {
-        if let Some(el) = ed.element_mut(r) {
-            transform(el, m);
-        }
+        minnamate_core::motion::edit_shown(ed.timeline_mut(), r, frame, |el| transform(el, m));
     }
 }
 
@@ -264,7 +264,7 @@ fn own_box(ed: &Editor) -> Option<Matrix> {
     let (r, el) = lone(ed)?;
     let m = match el {
         Element::Shape(s) => s.matrix,
-        Element::Instance(i) => i.matrix,
+        Element::Instance(_) => lone_instance(ed)?.matrix,
         _ => return None,
     };
     let local = hit::bounds_through(&ed.doc, ed.timeline(), ed.frame, &[r], m.inverse()?)?;
@@ -286,17 +286,21 @@ fn lone(ed: &Editor) -> Option<(ElementRef, &Element)> {
     Some((r, element(ed, r)?))
 }
 
-/// An instance keeps its own transformation point, as in Animate.
-fn lone_instance(ed: &Editor) -> Option<&Instance> {
+/// An instance keeps its own transformation point, as in Animate; a motion tween's
+/// target is where it shows.
+fn lone_instance(ed: &Editor) -> Option<Instance> {
     match lone(ed)? {
-        (_, Element::Instance(i)) => Some(i),
+        (r, Element::Instance(i)) => match crate::tweens::shown_target(ed, r) {
+            Some(Element::Instance(shown)) => Some(shown),
+            _ => Some(i.clone()),
+        },
         _ => None,
     }
 }
 
 /// The edited timeline's coordinates to screen points, as a matrix: what
 /// `screen_point` does, read off at three points (far apart, for precision).
-fn screen(ed: &Editor, stage: Rect) -> Matrix {
+pub(crate) fn screen(ed: &Editor, stage: Rect) -> Matrix {
     const STEP: f32 = 1024.0;
     let at = |p| screen_point(ed, stage, p);
     let (o, x, y) = (at((0.0, 0.0)), at((STEP, 0.0)), at((0.0, STEP)));
@@ -418,13 +422,20 @@ fn update(ed: &mut Editor, g: &mut Gesture, p: Point, shift: bool, alt: bool, re
     if m == g.m {
         return;
     }
+    let step = g.m.inverse().map(|undo| m * undo);
     g.m = m;
     if g.zone == Zone::Pivot {
         return;
     }
     ed.checkpoint_gesture("free-transform");
+    let frame = ed.frame;
     for (r, before) in &g.originals {
-        if let Some(el) = ed.element_mut(*r) {
+        // A motion tween's target is keyed by the step since the last update; the rest start over.
+        if minnamate_core::motion::tweening(ed.timeline(), *r, frame) {
+            if let Some(step) = step {
+                minnamate_core::motion::edit_shown(ed.timeline_mut(), *r, frame, |el| transform(el, &step));
+            }
+        } else if let Some(el) = ed.element_mut(*r) {
             *el = before.clone();
             transform(el, &m);
         }
@@ -452,7 +463,8 @@ fn keep(ed: &mut Editor, target: Target) {
 /// Moves the transformation point to `t.pivot`. An instance stores it, in its
 /// symbol's coordinates, so that is a document change.
 fn set_pivot(ed: &mut Editor, t: Target) {
-    if let Some((r, Element::Instance(inst))) = lone(ed)
+    if let [r] = ed.selection[..]
+        && let Some(inst) = lone_instance(ed)
         && let Some(local) = inst.matrix.inverse().map(|inv| inv.apply(t.pivot))
         && local != inst.pivot
     {

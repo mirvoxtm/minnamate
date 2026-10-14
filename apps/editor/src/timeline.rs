@@ -17,6 +17,7 @@ use minnamate_core::symbols;
 
 use crate::app::{Action, Editor, PanelId, PropsTab};
 use crate::icons::{self, Icon};
+use crate::layer_tree::{self, INDENT};
 use crate::theme;
 
 /// Medium rows, the default height.
@@ -32,12 +33,12 @@ pub(crate) const DEFAULT_CELL_W: f32 = 10.0;
 const MIN_CELL_W: f32 = 4.0;
 const MAX_CELL_W: f32 = 30.0;
 /// Toggle column centers, from the layer column's right edge: dot, outline, eye, lock.
-const DOT_X: f32 = 99.0;
+pub(crate) const DOT_X: f32 = 99.0;
 const OUTLINE_X: f32 = 77.0;
 const EYE_X: f32 = 51.0;
 const LOCK_X: f32 = 26.0;
 /// The layer type icon's center, from the panel's left edge.
-const TYPE_ICON_X: f32 = 30.0;
+pub(crate) const TYPE_ICON_X: f32 = 30.0;
 /// How far "All frames" onion skin reaches each way.
 const ONION_ALL: u32 = 16;
 
@@ -91,6 +92,10 @@ pub struct State {
     trash: Rect,
     /// The Onion Skin button, which its settings window opens above.
     pub(crate) onion_button: Rect,
+    /// Show Parenting View: a column of layer heads to link layers by.
+    pub parenting: bool,
+    /// The layer whose parent list is open in the parenting view, and where it opened.
+    pub(crate) parent_menu: Option<(usize, Pos2)>,
 }
 
 impl Default for State {
@@ -113,6 +118,8 @@ impl Default for State {
             props: None,
             trash: Rect::NOTHING,
             onion_button: Rect::NOTHING,
+            parenting: false,
+            parent_menu: None,
         }
     }
 }
@@ -129,6 +136,7 @@ impl State {
         self.loop_range = None;
         self.props = None;
         self.onion.anchor = None;
+        self.parent_menu = None;
     }
 }
 
@@ -191,6 +199,8 @@ enum Drag {
     Toggle(Toggle, bool),
     /// Pressed on a layer's name: a drag moves the selected layers.
     Layers { row: usize, dragging: bool },
+    /// Dragging layer `child`'s head in the parenting view, to the layer it will follow.
+    Parent { child: usize },
     /// Dragging the loop range's ends, a new range from a frame, or the whole range (Shift).
     LoopStart,
     LoopEnd,
@@ -348,7 +358,10 @@ fn toolbar(ui: &mut Ui, ed: &mut Editor) {
         action = Some(Action::DeleteLayer);
     }
     button_at(ui, pos2(column_right - 92.0, cy), Icon::Camera, "Add/Remove Camera", false, false, false);
-    button_at(ui, pos2(column_right - 59.0, cy), Icon::TlParenting, "Show Parenting View", false, false, true);
+    // ponytail: no press-and-hold menu (Propagate Scale, Skew, Flip): parenting always carries the whole transform.
+    if button_at(ui, pos2(column_right - 59.0, cy), Icon::TlParenting, "Show Parenting View", ed.tl.parenting, true, true).clicked() {
+        ed.tl.parenting = !ed.tl.parenting;
+    }
     button_at(ui, pos2(column_right - 28.0, cy), Icon::TlLayerDepth, "Layer Depth", false, false, false);
     p.vline(column_right, bar.y_range(), Stroke::new(1.0, theme::BORDER));
 
@@ -432,16 +445,20 @@ fn toolbar(ui: &mut Ui, ed: &mut Editor) {
         }
         group_menu(ui, &onion, |ui| onion_menu(ui, ed));
         button_at(ui, next(PITCH), Icon::TlEditMultiple, "Edit Multiple Frames", false, false, true);
-        let tween = button_at(ui, next(PITCH), Icon::TlClassicTween, "Create Classic Tween", false, true, true);
+        // The glyph shows the kind of tween last picked from its menu, which a click creates.
+        let (kind, icon, tip) = crate::tweens::tween_button(ui.ctx());
+        let tween = button_at(ui, next(PITCH), icon, tip, false, true, true);
         if tween.clicked() {
-            action = Some(Action::CreateClassicTween);
+            action = Some(kind);
         }
         group_menu(ui, &tween, |ui| {
-            if theme::menu_toggle(ui, true, true, "Create classic tween").clicked() {
-                action = Some(Action::CreateClassicTween);
+            let kinds = [("Create classic tween", Action::CreateClassicTween), ("Create motion tween", Action::CreateMotionTween), ("Create shape tween", Action::CreateShapeTween)];
+            for (label, command) in kinds {
+                if theme::menu_toggle(ui, available(ed, command), kind == command, label).clicked() {
+                    crate::tweens::pick_tween(ui.ctx(), command);
+                    action = Some(command);
+                }
             }
-            theme::menu_toggle(ui, false, false, "Create motion tween");
-            theme::menu_toggle(ui, false, false, "Create shape tween");
         });
         let at = next(PITCH + DIVIDER);
         if button_at(ui, at, Icon::TlCenterFrame, "Center Frame", false, true, false).clicked() {
@@ -521,10 +538,11 @@ pub(crate) fn keyframe_neighbors(ed: &Editor) -> (Option<u32>, Option<u32>) {
 
 /// The text field over a layer's name while it's being renamed: Enter or
 /// clicking away commits, Escape cancels.
-fn rename_field(ui: &mut Ui, ed: &mut Editor, geo: Geo, left: f32) {
+fn rename_field(ui: &mut Ui, ed: &mut Editor, geo: &Geo, left: f32) {
+    let indent = ed.renaming.as_ref().map_or(0.0, |(l, _)| ed.timeline().depth(*l) as f32 * INDENT);
     let Some((layer, name)) = &mut ed.renaming else { return };
     let top = geo.top_of(*layer);
-    let rect = Rect::from_min_max(pos2(left + 46.0, top + 2.0), pos2(geo.frames.left() - DOT_X - 12.0, top + geo.row_h - 2.0));
+    let rect = Rect::from_min_max(pos2(left + 46.0 + indent, top + 2.0), pos2(geo.frames.left() - DOT_X - 12.0, top + geo.row_h - 2.0));
     let resp = ui.put(rect, egui::TextEdit::singleline(name).margin(egui::vec2(3.0, 1.0)));
     if !resp.has_focus() && !resp.lost_focus() {
         resp.request_focus();
@@ -563,11 +581,11 @@ pub(crate) fn next_color(tl: &Timeline) -> Rgba {
     crate::app::rgba(theme::LAYER_COLORS[tl.layers.len() % theme::LAYER_COLORS.len()])
 }
 
-/// A copy of layer `l` with its color stored in it, to paste elsewhere.
-fn layer_copy(ed: &Editor, l: usize) -> Layer {
-    let mut layer = ed.timeline().layers[l].clone();
-    layer.set_color(crate::app::rgba(layer_color(&layer, l)));
-    layer
+/// Copies of layers `rows`, folders with what they hold, their colors stored in them, to paste elsewhere.
+fn layer_copies(ed: &Editor, rows: &[usize]) -> Vec<Layer> {
+    let mut tl = ed.timeline().clone();
+    pin_colors(&mut tl);
+    tl.copy_layers(rows)
 }
 
 /// Which toggle column a point in the layer list is over.
@@ -605,11 +623,15 @@ fn set_marked(l: &mut Layer, which: Toggle, on: bool) {
     }
 }
 
-/// Sets `which` on one row; a press and drag down the column is one undo step.
+/// Sets `which` on one row, and on what's in it if it's a folder; a press and drag
+/// down the column is one undo step.
 fn set_toggle(ed: &mut Editor, which: Toggle, row: usize, on: bool) {
     if ed.timeline().layers.get(row).is_some_and(|l| marked(l, which) != on) {
         ed.checkpoint_gesture("layer-toggle");
-        set_marked(&mut ed.timeline_mut().layers[row], which, on);
+        let tl = ed.timeline_mut();
+        for l in tl.with_contents(&[row]) {
+            set_marked(&mut tl.layers[l], which, on);
+        }
         keep_selection(ed);
     }
 }
@@ -624,13 +646,14 @@ fn toggle_all(ed: &mut Editor, which: Toggle) {
     keep_selection(ed);
 }
 
-/// Alt+click: marks every other layer and clears `row`; when the others all
-/// had the mark already, clears it everywhere.
+/// Alt+click: marks every other layer and clears `row` (a folder, with what's in it);
+/// when the others all had the mark already, clears it everywhere.
 fn solo(ed: &mut Editor, which: Toggle, row: usize) {
-    let others = ed.timeline().layers.iter().enumerate().filter(|&(i, _)| i != row).all(|(_, l)| marked(l, which));
+    let own = ed.timeline().with_contents(&[row]);
+    let others = ed.timeline().layers.iter().enumerate().filter(|(i, _)| !own.contains(i)).all(|(_, l)| marked(l, which));
     ed.checkpoint();
     for (i, l) in ed.timeline_mut().layers.iter_mut().enumerate() {
-        set_marked(l, which, i != row && !others);
+        set_marked(l, which, !own.contains(&i) && !others);
     }
     keep_selection(ed);
 }
@@ -642,7 +665,7 @@ fn sel_key(ed: &Editor) -> SelKey {
 }
 
 /// Keeps the selection through an edit the timeline made itself.
-fn keep_selection(ed: &mut Editor) {
+pub(crate) fn keep_selection(ed: &mut Editor) {
     ed.tl.sel_at = Some(sel_key(ed));
 }
 
@@ -677,7 +700,7 @@ fn select(ed: &mut Editor, cells: Cells, (layer, frame): (usize, u32)) {
 }
 
 /// The selected layers, top first: those with selected frames, and the active one.
-fn selected_layers(ed: &Editor) -> Vec<usize> {
+pub(crate) fn selected_layers(ed: &Editor) -> Vec<usize> {
     let count = ed.timeline().layers.len();
     let layers: BTreeSet<usize> = selection(ed).iter().map(|c| c.0).chain([ed.layer]).filter(|&l| l < count).collect();
     layers.into_iter().collect()
@@ -818,29 +841,23 @@ fn press_layer(ed: &mut Editor, row: usize, mods: Modifiers) {
     }
 }
 
-/// Moves the selected layers to the gap above layer `gap` (`layers.len()` is the bottom).
-fn reorder(ed: &mut Editor, gap: usize) {
+/// Moves the selected layers, with what's in them, to the gap above layer `gap`
+/// (`layers.len()` is the bottom), into `parent` (a folder, mask or guide) or out of any.
+fn reorder(ed: &mut Editor, gap: usize, parent: Option<usize>) {
     let moving = selected_layers(ed);
-    let gap = gap.min(ed.timeline().layers.len());
-    let to = gap - moving.iter().filter(|&&l| l < gap).count();
-    if moving.iter().enumerate().all(|(i, &l)| l == to + i) {
+    let mut tl = ed.timeline().clone();
+    pin_colors(&mut tl);
+    let pinned = tl.clone();
+    let Some(went) = tl.move_into(&moving, gap, parent) else { return };
+    if tl == pinned {
         return;
     }
     ed.checkpoint();
-    pin_colors(ed.timeline_mut());
-    ed.timeline_mut().move_layers(&moving, gap);
-    // Where each layer went: the moved ones from `to` on, the rest closing up around them.
-    let row = |l: usize| {
-        let rest = l - moving.iter().filter(|&&m| m < l).count();
-        Some(match moving.iter().position(|&m| m == l) {
-            Some(i) => to + i,
-            None if rest < to => rest,
-            None => rest + moving.len(),
-        })
-    };
+    *ed.timeline_mut() = tl;
+    let row = |l: usize| went.get(l).copied();
     let cells: Cells = ed.tl.sel.iter().filter_map(|&(l, f)| Some((row(l)?, f))).collect();
-    let active = row(ed.layer).unwrap_or(to);
-    ed.tl.anchor.0 = row(ed.tl.anchor.0).unwrap_or(to);
+    let active = row(ed.layer).unwrap_or(0);
+    ed.tl.anchor.0 = row(ed.tl.anchor.0).unwrap_or(active);
     ed.follow_layers(row);
     select(ed, cells, (active, ed.frame));
 }
@@ -859,6 +876,11 @@ pub fn available(ed: &Editor, action: Action) -> bool {
         | CutFrames | CopyFrames => !runs.is_empty(),
         CreateClassicTween => keys(&|k, f, n| k.index < f + n && k.index + k.duration > f && k.tween == Tween::None),
         RemoveTween => keys(&|k, f, n| k.index < f + n && k.index + k.duration > f && k.tween != Tween::None),
+        CreateShapeTween => keys(&|k, f, n| k.index < f + n && k.index + k.duration > f && !matches!(k.tween, Tween::Shape { .. })),
+        CreateMotionTween => {
+            keys(&|k, f, n| k.index < f + n && k.index + k.duration > f && !k.elements.is_empty() && !matches!(k.tween, Tween::Motion(_)))
+        }
+        InsertPropertyKeyframe(_) | ClearPropertyKeyframe(_) | SplitMotion => crate::tweens::keyed(ed, &cells, action),
         ClearKeyframe => keys(&|k, f, n| k.index > 0 && (f..f + n).contains(&k.index)),
         PasteFrames | PasteOverwriteFrames => ed.tl.clip.as_ref().is_some_and(|(rows, _)| !nests(ed, rows.iter().flatten())),
         ReverseFrames => !runs.is_empty() && runs.iter().all(|&(l, f, n)| layers[l].can_reverse(f, n)),
@@ -869,6 +891,9 @@ pub fn available(ed: &Editor, action: Action) -> bool {
         PasteLayers => !ed.tl.layer_clip.is_empty() && !nests(ed, ed.tl.layer_clip.iter().flat_map(|l| &l.frames)),
         ShowAllLayers => layers.iter().any(|l| !l.visible() || l.locked()),
         ToggleGuide => layers.get(ed.layer).is_some_and(|l| matches!(l.kind, LayerKind::Normal | LayerKind::Guide)),
+        ToggleMask | AddMotionGuide | ShowMasking | ExpandFolders | CollapseFolders | ExpandAllFolders | CollapseAllFolders => {
+            layer_tree::available(ed, action)
+        }
         _ => true,
     }
 }
@@ -901,18 +926,21 @@ pub fn command(ed: &mut Editor, action: Action) {
         Action::NewFolder => {
             ed.checkpoint();
             let n = ed.timeline().layers.iter().filter(|l| l.kind == LayerKind::Folder).count() + 1;
-            let at = ed.layer;
+            // Above the selected layer, or above its mask or guide: a folder can't go between them.
+            let at = ed.timeline().mask_of(ed.layer).or(ed.timeline().guide_of(ed.layer)).unwrap_or(ed.layer);
             let tl = ed.timeline_mut();
             pin_colors(tl);
             let color = next_color(tl);
             let at = tl.insert_folder(at, &format!("Folder_{n}"));
             tl.layers[at].set_color(color);
+            tl.adopt(at);
             ed.layer = at;
             ed.follow_layers(|l| Some(if l < at { l } else { l + 1 }));
         }
         Action::DeleteLayer => delete_layers(ed),
+        Action::InsertPropertyKeyframe(_) | Action::ClearPropertyKeyframe(_) => crate::tweens::property_keys(ed, action, &cells),
         Action::CopyLayers | Action::CutLayers => {
-            ed.tl.layer_clip = selected_layers(ed).iter().map(|&l| layer_copy(ed, l)).collect();
+            ed.tl.layer_clip = layer_copies(ed, &selected_layers(ed));
             if action == Action::CutLayers {
                 delete_layers(ed);
             }
@@ -922,7 +950,7 @@ pub fn command(ed: &mut Editor, action: Action) {
                 Action::PasteLayers => (ed.layer, ed.tl.layer_clip.clone()),
                 _ => {
                     let selected = selected_layers(ed);
-                    (selected[0], selected.iter().map(|&l| layer_copy(ed, l)).collect())
+                    (selected[0], layer_copies(ed, &selected))
                 }
             };
             if action == Action::DuplicateLayers {
@@ -932,7 +960,15 @@ pub fn command(ed: &mut Editor, action: Action) {
             let count = new.len();
             let tl = ed.timeline_mut();
             pin_colors(tl);
-            let at = tl.insert_layers(at, new);
+            // Above the selected layer, in with it; pasted onto a folder, into it at its top.
+            let (gap, parent) = match tl.layers.get(at) {
+                Some(l) if action == Action::PasteLayers && l.kind == LayerKind::Folder => (at + 1, Some(at)),
+                _ => (at, tl.parent(at)),
+            };
+            if parent == Some(at) {
+                tl.layers[at].set_open(true);
+            }
+            let at = tl.paste_layers(gap, parent, new);
             ed.follow_layers(|l| Some(if l < at { l } else { l + count }));
             let cells = (at..at + count).flat_map(|l| layer_cells(ed, l)).collect();
             select(ed, cells, (at, ed.frame));
@@ -959,9 +995,14 @@ pub fn command(ed: &mut Editor, action: Action) {
         Action::ToggleGuide => {
             ed.checkpoint();
             let l = ed.layer;
-            let layer = &mut ed.timeline_mut().layers[l];
-            layer.kind = if layer.kind == LayerKind::Guide { LayerKind::Normal } else { LayerKind::Guide };
+            let tl = ed.timeline_mut();
+            let on = tl.layers[l].kind != LayerKind::Guide;
+            tl.set_guide(l, on);
             keep_selection(ed);
+        }
+        Action::ToggleMask | Action::AddMotionGuide | Action::ShowMasking => layer_tree::command(ed, action),
+        Action::ExpandFolders | Action::CollapseFolders | Action::ExpandAllFolders | Action::CollapseAllFolders => {
+            layer_tree::command(ed, action)
         }
         Action::LayerProperties => {
             let l = ed.layer;
@@ -999,8 +1040,11 @@ fn edit_frames(ed: &mut Editor, action: Action, cells: &Cells) {
     let single = cells.len() == 1;
     let mut acted = None;
     let objects = ed.selection.clone();
+    let fps = ed.doc.frame_rate;
     // On a copy: frames past the end, say, leave nothing to change and no undo step.
     ed.edit_timeline(|_, tl| {
+        // F6 copies keyframes as stored; along a guide or after a parent they then show what showed.
+        let before = matches!(action, InsertKeyframe | ConvertToKeyframes).then(|| tl.clone());
         let layers = &mut tl.layers;
         match action {
             InsertFrame => firsts.iter().for_each(|&(l, f, n)| layers[l].insert_frames(f, n)),
@@ -1021,12 +1065,16 @@ fn edit_frames(ed: &mut Editor, action: Action, cells: &Cells) {
                 runs.iter().for_each(|&(l, f, n)| layers[l].convert_to_keyframes(f, n, action == ConvertToBlankKeyframes))
             }
             ClearKeyframe => runs.iter().for_each(|&(l, f, n)| layers[l].clear_keyframes(f, n)),
-            CreateClassicTween | RemoveTween => {
+            SplitMotion => runs.iter().for_each(|&(l, f, _)| _ = layers[l].split_motion(f)),
+            CreateClassicTween | CreateShapeTween | CreateMotionTween | RemoveTween => {
                 for &(l, f, n) in &runs {
                     let starts: Vec<u32> = layers[l].frames.iter().filter(|k| k.index < f + n && k.index + k.duration > f).map(|k| k.index).collect();
                     for s in starts {
                         match action {
                             CreateClassicTween => layers[l].create_classic_tween(s),
+                            CreateShapeTween => layers[l].create_shape_tween(s),
+                            // Spans whose contents aren't one instance or text stay: see tweens::create_motion_tween.
+                            CreateMotionTween => _ = layers[l].create_motion_tween(s, fps),
                             _ => layers[l].remove_tween(s),
                         }
                     }
@@ -1035,6 +1083,9 @@ fn edit_frames(ed: &mut Editor, action: Action, cells: &Cells) {
             ClearFrames | CutFrames => runs.iter().for_each(|&(l, f, n)| layers[l].clear_frames(f, n)),
             ReverseFrames => runs.iter().for_each(|&(l, f, n)| layers[l].reverse_frames(f, n)),
             _ => {}
+        }
+        if let Some(before) = before {
+            minnamate_core::layer_motion::keep_shown(&before, tl);
         }
         objects
     });
@@ -1075,9 +1126,9 @@ fn paste(ed: &mut Editor, cells: &Cells, overwrite: bool) {
     ed.prune_selection();
 }
 
-/// Delete Layers: the selected ones, as long as one layer is left.
+/// Delete Layers: the selected ones, folders with what's in them, as long as one layer is left.
 fn delete_layers(ed: &mut Editor) {
-    let doomed = selected_layers(ed);
+    let doomed = ed.timeline().with_contents(&selected_layers(ed));
     if doomed.is_empty() || doomed.len() >= ed.timeline().layers.len() {
         return;
     }
@@ -1124,19 +1175,34 @@ pub fn onion_frames(ed: &Editor, l: usize) -> Vec<(u32, Color32, f32)> {
 }
 
 /// The frame grid's geometry.
-#[derive(Clone, Copy)]
-struct Geo {
+#[derive(Clone)]
+pub(crate) struct Geo {
     frames: Rect,
     rows_top: f32,
-    row_h: f32,
+    pub(crate) row_h: f32,
     cell_w: f32,
     first_frame: f32,
     first_layer: f32,
+    /// The layers listed, top first: those in a closed folder aren't.
+    pub(crate) rows: Vec<usize>,
 }
 
 impl Geo {
     fn new(ed: &Editor, frames: Rect, rows_top: f32) -> Self {
-        Geo { frames, rows_top, row_h: ed.tl.row_h, cell_w: ed.cell_w, first_frame: ed.first_visible_frame, first_layer: ed.first_visible_layer }
+        let tl = ed.timeline();
+        let rows = (0..tl.layers.len()).filter(|&l| tl.listed(l)).collect();
+        Geo { frames, rows_top, row_h: ed.tl.row_h, cell_w: ed.cell_w, first_frame: ed.first_visible_frame, first_layer: ed.first_visible_layer, rows }
+    }
+
+    /// The layer listed at `y`.
+    pub(crate) fn layer_at(&self, y: f32) -> Option<usize> {
+        let r = self.row_at(y).floor();
+        if r < 0.0 { None } else { self.rows.get(r as usize).copied() }
+    }
+
+    /// The top of visual row `r` (`rows.len()` is just under the last).
+    pub(crate) fn top_of_row(&self, r: usize) -> f32 {
+        self.rows_top + (r as f32 - self.first_layer) * self.row_h
     }
 
     fn x_of(&self, f: u32) -> f32 {
@@ -1148,12 +1214,13 @@ impl Geo {
     }
 
     /// The row under `y`, fractional.
-    fn row_at(&self, y: f32) -> f32 {
+    pub(crate) fn row_at(&self, y: f32) -> f32 {
         (y - self.rows_top) / self.row_h + self.first_layer
     }
 
-    fn top_of(&self, row: usize) -> f32 {
-        self.rows_top + (row as f32 - self.first_layer) * self.row_h
+    /// The top of layer `l`'s row, or of its closed folder's.
+    pub(crate) fn top_of(&self, l: usize) -> f32 {
+        self.top_of_row(self.rows.iter().rposition(|&r| r <= l).unwrap_or(0))
     }
 }
 
@@ -1175,7 +1242,7 @@ fn grid(ui: &mut Ui, ed: &mut Editor) {
     let names = Rect::from_min_max(pos2(rect.left(), rows_top), pos2(column_right, rect.bottom()));
     let cells = Rect::from_min_max(pos2(column_right, rows_top), rect.max);
     ed.layer_rows = names;
-    let count = ed.timeline().layers.len();
+    let count = layer_tree::listed(ed.timeline());
     let shown = (names.height() / ed.tl.row_h).floor().max(1.0);
     let max_layer = (count as f32 - shown).max(0.0);
     ed.first_visible_layer = ed.first_visible_layer.clamp(0.0, max_layer);
@@ -1192,10 +1259,8 @@ fn grid(ui: &mut Ui, ed: &mut Editor) {
     let geo = Geo::new(ed, frames, rows_top);
     let mods = ui.input(|i| i.modifiers);
     let idle = ed.tl.drag.is_none();
-    let row_at = |p: Pos2| {
-        let r = geo.row_at(p.y).floor();
-        (r >= 0.0 && (r as usize) < count).then_some(r as usize)
-    };
+    let row_at = |p: Pos2| geo.layer_at(p.y);
+    let mut open_parents = false;
 
     // Presses: the header toggles every layer, the ruler scrubs or sets the
     // loop range, the list selects and toggles layers, the grid selects frames.
@@ -1233,7 +1298,13 @@ fn grid(ui: &mut Ui, ed: &mut Editor) {
                 set_toggle(ed, which, row, on);
                 ed.tl.drag = Some(Drag::Toggle(which, on));
             }
-            None => press_layer(ed, row, mods),
+            None => match layer_tree::part_at(ed, &geo, row, p, rect.left(), column_right) {
+                layer_tree::Part::Triangle => layer_tree::toggle_open(ed, row),
+                layer_tree::Part::Head => ed.tl.drag = Some(Drag::Parent { child: row }),
+                // Its list opens on the click: see below.
+                layer_tree::Part::Strip => {}
+                layer_tree::Part::Icon | layer_tree::Part::Name => press_layer(ed, row, mods),
+            },
         }
     }
     if let Some(p) = pressed(ui, &cells_resp)
@@ -1270,7 +1341,7 @@ fn grid(ui: &mut Ui, ed: &mut Editor) {
     if idle {
         ed.tl.drag_on = (ed.rev, ed.scene);
     }
-    track(ui, ed, geo);
+    track(ui, ed, &geo);
     // A click in the loop strip moves the playhead too, as anywhere on the ruler.
     if ruler_resp.clicked()
         && let Some(p) = ruler_resp.interact_pointer_pos()
@@ -1301,15 +1372,24 @@ fn grid(ui: &mut Ui, ed: &mut Editor) {
         }
         ed.tl.menu_cell = cell;
     }
+    // A click in the parenting view, off the layer's head, lists the layers it can follow.
+    if names_resp.clicked()
+        && let Some(p) = names_resp.interact_pointer_pos()
+        && let Some(row) = row_at(p)
+        && toggle_at(p.x, column_right).is_none()
+        && matches!(layer_tree::part_at(ed, &geo, row, p, rect.left(), column_right), layer_tree::Part::Strip)
+    {
+        (ed.tl.parent_menu, open_parents) = (Some((row, p)), true);
+    }
     if names_resp.double_clicked()
         && let Some(p) = names_resp.interact_pointer_pos()
         && let Some(row) = row_at(p)
         && toggle_at(p.x, column_right).is_none()
     {
-        if p.x < rect.left() + TYPE_ICON_X + 9.0 {
-            command(ed, Action::LayerProperties);
-        } else {
-            ed.renaming = Some((row, ed.timeline().layers[row].name.clone()));
+        match layer_tree::part_at(ed, &geo, row, p, rect.left(), column_right) {
+            layer_tree::Part::Icon => command(ed, Action::LayerProperties),
+            layer_tree::Part::Name => ed.renaming = Some((row, ed.timeline().layers[row].name.clone())),
+            _ => {}
         }
     }
     if names_resp.secondary_clicked()
@@ -1322,14 +1402,15 @@ fn grid(ui: &mut Ui, ed: &mut Editor) {
     }
 
     let geo = Geo::new(ed, frames, rows_top);
-    paint(ui, ed, rect, geo, thumbs);
-    rename_field(ui, ed, geo, rect.left());
+    paint(ui, ed, rect, &geo, thumbs);
+    rename_field(ui, ed, &geo, rect.left());
     let mut picked = None;
     theme::context_menu(&cells_resp, |ui| picked = frame_menu(ui, ed));
     theme::context_menu(&names_resp, |ui| picked = picked.or(layer_menu(ui, ed)));
     if let Some(action) = picked {
         ed.run(action, ui.ctx());
     }
+    layer_tree::parent_menu(ui, ed, open_parents);
 
     // The wheel scrolls layers when they overflow, frames otherwise; sideways always scrolls frames.
     if ui.rect_contains_pointer(rect) {
@@ -1349,7 +1430,7 @@ fn grid(ui: &mut Ui, ed: &mut Editor) {
 }
 
 /// Follows the pointer while a gesture's button is down, and finishes the gesture when it comes up.
-fn track(ui: &Ui, ed: &mut Editor, geo: Geo) {
+fn track(ui: &Ui, ed: &mut Editor, geo: &Geo) {
     let Some(drag) = ed.tl.drag else { return };
     // A key that changed the document or the scene mid-gesture (Ctrl+Z, Shift+F5, End) ends it:
     // the layers, frames or loop range it holds on to may be gone. Toggles change it themselves.
@@ -1361,7 +1442,9 @@ fn track(ui: &Ui, ed: &mut Editor, geo: Geo) {
     let count = ed.timeline().layers.len();
     if let Some(pos) = pos {
         let f = geo.frame_at(pos.x);
-        let row = (geo.row_at(pos.y).floor().max(0.0) as usize).min(count.saturating_sub(1));
+        // The layer listed under the pointer, or the nearest end of the list.
+        let listed = (geo.row_at(pos.y).floor().max(0.0) as usize).min(geo.rows.len().saturating_sub(1));
+        let row = geo.rows.get(listed).copied().unwrap_or(0);
         // Dragging frames past the grid's left or right edge scrolls it.
         let edge = (pos.x - geo.frames.right() + 4.0).max(0.0) - (geo.frames.left() + 4.0 - pos.x).max(0.0);
         if down && edge != 0.0 && matches!(drag, Drag::Select | Drag::Move { .. } | Drag::Stretch { .. }) {
@@ -1461,9 +1544,18 @@ fn track(ui: &Ui, ed: &mut Editor, geo: Geo) {
         // Dropped on the toolbar's Delete button, the layers go.
         Some(Drag::Layers { dragging: true, .. }) => match pos {
             Some(p) if ed.tl.trash.contains(p) => delete_layers(ed),
-            Some(p) => reorder(ed, geo.row_at(p.y).round().clamp(0.0, count as f32) as usize),
+            Some(p) => {
+                let landing = layer_tree::drop_at(ed, geo, p.y);
+                reorder(ed, landing.gap, landing.parent);
+            }
             None => {}
         },
+        // A head dropped on another layer: that's the layer it follows now.
+        Some(Drag::Parent { child }) => {
+            if let Some(target) = pos.and_then(|p| geo.layer_at(p.y)).filter(|&t| t != child) {
+                layer_tree::set_rig_parent(ed, child, Some(target));
+            }
+        }
         _ => {}
     }
 }
@@ -1482,7 +1574,7 @@ fn scrollbars(ui: &Ui, ed: &mut Editor, id: egui::Id, frames: Rect, rows: Rect, 
         ed.first_visible_frame = (ed.first_visible_frame + resp.drag_delta().x / track.width() * total).max(0.0);
     }
     let down = (max_layer > 0.0).then(|| {
-        let count = ed.timeline().layers.len() as f32;
+        let count = layer_tree::listed(ed.timeline()) as f32;
         let track = Rect::from_min_max(pos2(frames.right() - 9.0, rows.top() + 2.0), pos2(frames.right() - 2.0, rows.bottom() - 11.0));
         let len = (shown / count * track.height()).clamp(20.0, track.height());
         let y = track.top() + ed.first_visible_layer / count * track.height();
@@ -1496,10 +1588,10 @@ fn scrollbars(ui: &Ui, ed: &mut Editor, id: egui::Id, frames: Rect, rows: Rect, 
     [Some(across), down]
 }
 
-fn paint(ui: &Ui, ed: &Editor, rect: Rect, geo: Geo, thumbs: [Option<Rect>; 2]) {
+fn paint(ui: &Ui, ed: &Editor, rect: Rect, geo: &Geo, thumbs: [Option<Rect>; 2]) {
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 0.0, theme::FRAME_CELL);
-    let Geo { frames, rows_top, row_h, cell_w, .. } = geo;
+    let (frames, rows_top, row_h, cell_w) = (geo.frames, geo.rows_top, geo.row_h, geo.cell_w);
     let ruler = Rect::from_min_max(frames.min, pos2(frames.right(), rows_top));
     let column_right = frames.left();
     let first = geo.first_frame.floor() as u32;
@@ -1571,9 +1663,10 @@ fn paint(ui: &Ui, ed: &Editor, rect: Rect, geo: Geo, thumbs: [Option<Rect>; 2]) 
     let selected_rows = selected_layers(ed);
     let rows_area = Rect::from_min_max(pos2(rect.left(), rows_top), rect.max);
     let p = p.with_clip_rect(rows_area);
-    let hovered_row = hover.filter(|h| h.y >= rows_top).map(|h| geo.row_at(h.y).floor() as usize);
-    for (i, layer) in layers.iter().enumerate() {
-        let top = geo.top_of(i);
+    let hovered_row = hover.filter(|h| h.y >= rows_top).and_then(|h| geo.layer_at(h.y));
+    for (r, &i) in geo.rows.iter().enumerate() {
+        let layer = &layers[i];
+        let top = geo.top_of_row(r);
         if top + row_h < rows_top {
             continue;
         }
@@ -1591,15 +1684,14 @@ fn paint(ui: &Ui, ed: &Editor, rect: Rect, geo: Geo, thumbs: [Option<Rect>; 2]) 
             theme::PANEL_BG
         };
         p.rect_filled(cell, 0.0, row_fill);
-        let icon = match layer.kind {
-            LayerKind::Folder => Icon::Folder,
-            _ => Icon::Layer,
-        };
+        // Inside folders, masks and guides, indented; a folder with its disclosure triangle.
         let cy = cell.center().y;
-        icons::paint(&p, Rect::from_center_size(pos2(cell.left() + TYPE_ICON_X, cy), vec2(15.0, 15.0)), icon, theme::TEXT_DIM);
+        let indent = ed.timeline().depth(i) as f32 * INDENT;
+        layer_tree::paint_kind(&p, ed.timeline(), i, pos2(cell.left() + indent, cy));
         let name_color = if selected { Color32::WHITE } else { theme::LAYER_NAME };
-        let name_room = Rect::from_min_max(pos2(cell.left() + 46.0, top), pos2(column_right - DOT_X - 10.0, top + row_h));
-        p.with_clip_rect(name_room).text(pos2(cell.left() + 50.0, cy), Align2::LEFT_CENTER, &layer.name, FontId::proportional(12.0), name_color);
+        let name_right = column_right - DOT_X - 10.0 - if ed.tl.parenting { layer_tree::PARENTING_W } else { 0.0 };
+        let name_room = Rect::from_min_max(pos2(cell.left() + 46.0 + indent, top), pos2(name_right, top + row_h));
+        p.with_clip_rect(name_room).text(pos2(cell.left() + 50.0 + indent, cy), Align2::LEFT_CENTER, &layer.name, FontId::proportional(12.0), name_color);
         // Toggle columns: highlight dot, outline swatch, eye, lock.
         if selected || hot {
             p.circle_filled(pos2(column_right - DOT_X, cy), 3.0, color);
@@ -1640,6 +1732,9 @@ fn paint(ui: &Ui, ed: &Editor, rect: Rect, geo: Geo, thumbs: [Option<Rect>; 2]) 
         }
         p.hline(rect.x_range(), top + row_h - 0.5, hairline);
     }
+    if ed.tl.parenting {
+        layer_tree::paint_parenting(&p, ed, geo, column_right);
+    }
 
     // What a drag will do: the block's new place, a span's new end, or where layers land.
     let outline = Stroke::new(1.5, theme::TEXT);
@@ -1657,12 +1752,24 @@ fn paint(ui: &Ui, ed: &Editor, rect: Rect, geo: Geo, thumbs: [Option<Rect>; 2]) 
             let top = geo.top_of(layer);
             p.rect_stroke(Rect::from_min_max(pos2(x_of(start), top), pos2(x_of(to + 1), top + row_h)), 0.0, outline, StrokeKind::Inside);
         }
+        // Into a folder, mask or guide: its row outlined; else a line at the gap, indented to where they'll sit.
         Some(Drag::Layers { dragging: true, .. }) => {
             if let Some(h) = hover {
-                let gap = geo.row_at(h.y).round().clamp(0.0, layers.len() as f32) as usize;
-                p.hline(rect.left()..=column_right, geo.top_of(gap), Stroke::new(2.0, theme::PLAYHEAD));
+                let landing = layer_tree::drop_at(ed, geo, h.y);
+                let line = Stroke::new(2.0, theme::PLAYHEAD);
+                match landing.onto {
+                    Some(l) => {
+                        let top = geo.top_of(l);
+                        p.rect_stroke(Rect::from_min_max(pos2(rect.left(), top), pos2(column_right, top + row_h)), 0.0, line, StrokeKind::Inside);
+                    }
+                    None => {
+                        let indent = landing.parent.map_or(0.0, |f| (ed.timeline().depth(f) + 1) as f32 * INDENT);
+                        p.hline(rect.left() + indent..=column_right, landing.y, line);
+                    }
+                }
             }
         }
+        Some(Drag::Parent { child }) => layer_tree::paint_parent_drag(&p, ed, geo, column_right, child, hover),
         _ => {}
     }
     let p = ui.painter_at(rect);
@@ -1686,7 +1793,7 @@ fn paint(ui: &Ui, ed: &Editor, rect: Rect, geo: Geo, thumbs: [Option<Rect>; 2]) 
 
 /// One layer's keyframe spans: fills, the selection over them, keyframe
 /// dots, tween arrows, span ends, labels and frame-script marks.
-fn spans(p: &Painter, layer: &Layer, first: u32, visible: u32, top: f32, geo: Geo, selected: &dyn Fn(u32) -> bool) {
+fn spans(p: &Painter, layer: &Layer, first: u32, visible: u32, top: f32, geo: &Geo, selected: &dyn Fn(u32) -> bool) {
     let (row_h, cell_w, x_of) = (geo.row_h, geo.cell_w, |f: u32| geo.x_of(f));
     let ink = theme::KEYFRAME;
     let dot_y = top + row_h * 0.65;
@@ -1701,6 +1808,8 @@ fn spans(p: &Painter, layer: &Layer, first: u32, visible: u32, top: f32, geo: Ge
         let has_next = layer.frames.get(k + 1).is_some_and(|n| n.index == end);
         let fill = match &key.tween {
             Tween::Classic { .. } => theme::CLASSIC_TWEEN,
+            Tween::Shape { .. } => theme::SHAPE_TWEEN,
+            Tween::Motion(_) => theme::MOTION_TWEEN,
             Tween::Unsupported(kind) if kind == "shape" => theme::SHAPE_TWEEN,
             Tween::Unsupported(_) => theme::MOTION_TWEEN,
             Tween::None if filled => theme::FRAME_SPAN,
@@ -1732,11 +1841,14 @@ fn spans(p: &Painter, layer: &Layer, first: u32, visible: u32, top: f32, geo: Ge
             label(p, span, x0, x1, row_h, name, kind);
         }
         let tweening = !matches!(key.tween, Tween::None);
-        if tweening {
-            // An arrow at dot height to the next keyframe; dashed when there's none to reach.
+        if matches!(key.tween, Tween::Motion(_)) {
+            // A motion tween has diamonds at its property keyframes, not an arrow.
+            crate::tweens::paint_span(p, key, &x_of, cell_w, dot_y, span);
+        } else if tweening {
+            // An arrow at dot height to the next keyframe; dashed when there's none to reach, or the tween is broken.
             let (from, tip) = (dot.x + 4.0, x1 - 3.0);
             let stroke = Stroke::new(1.0, ink);
-            if has_next {
+            if has_next && crate::tweens::plays(key, layer.frames.get(k + 1)) {
                 p.line_segment([pos2(from, dot_y), pos2(tip, dot_y)], stroke);
                 p.line_segment([pos2(tip - 4.0, dot_y - 3.0), pos2(tip, dot_y)], stroke);
                 p.line_segment([pos2(tip - 4.0, dot_y + 3.0), pos2(tip, dot_y)], stroke);
@@ -1779,8 +1891,10 @@ fn frame_menu(ui: &mut Ui, ed: &Editor) -> Option<Action> {
     ui.set_min_width(250.0);
     let tween = key_at(ed, ed.tl.menu_cell).map(|k| &k.tween);
     let classic = matches!(tween, Some(Tween::Classic { .. }));
-    let shape = matches!(tween, Some(Tween::Unsupported(k)) if k == "shape");
-    let motion = matches!(tween, Some(Tween::Unsupported(k)) if k != "shape");
+    let shape = matches!(tween, Some(Tween::Shape { .. })) || matches!(tween, Some(Tween::Unsupported(k)) if k == "shape");
+    let motion = matches!(tween, Some(Tween::Motion(_))) || matches!(tween, Some(Tween::Unsupported(k)) if k != "shape");
+    // Inside a motion tween, its keyframes are its properties'.
+    let mut keyframes = None;
     let mut picked = None;
     let mut item = |ui: &mut Ui, label: &str, keys: &str, action: Option<Action>| {
         let enabled = action.is_some_and(|a| available(ed, a));
@@ -1793,8 +1907,8 @@ fn frame_menu(ui: &mut Ui, ed: &Editor) -> Option<Action> {
     } else {
         item(ui, "Create Classic Tween", "", Some(CreateClassicTween));
     }
-    item(ui, if motion { "Remove Motion Tween" } else { "Create Motion Tween" }, "", None);
-    item(ui, if shape { "Remove Shape Tween" } else { "Create Shape Tween" }, "", shape.then_some(RemoveTween));
+    item(ui, if motion { "Remove Motion Tween" } else { "Create Motion Tween" }, "", Some(if motion { RemoveTween } else { CreateMotionTween }));
+    item(ui, if shape { "Remove Shape Tween" } else { "Create Shape Tween" }, "", Some(if shape { RemoveTween } else { CreateShapeTween }));
     ui.add_enabled_ui(false, |ui| ui.menu_button("Convert to Frame-by-Frame Animation", |_| {}));
     let blocks: [&[(&str, &str, Option<Action>)]; 5] = [
         &[("Insert Frame", "F5", Some(InsertFrame)), ("Remove Frames", "Shift+F5", Some(RemoveFrames))],
@@ -1816,15 +1930,23 @@ fn frame_menu(ui: &mut Ui, ed: &Editor) -> Option<Action> {
         &[("Copy Motion", "", None), ("Paste Motion", "", None), ("Paste Motion Special...", "", None)],
         &[("Reverse Frames", "", Some(ReverseFrames)), ("Synchronize Symbols", "", None), ("Split Audio", "", None), ("Show In Library", "", None)],
     ];
-    for block in blocks {
+    for (i, block) in blocks.into_iter().enumerate() {
         ui.separator();
+        if i == 1 && matches!(tween, Some(Tween::Motion(_))) {
+            keyframes = crate::tweens::keyframe_menu(ui, ed);
+            continue;
+        }
+        if i == 3 && matches!(tween, Some(Tween::Motion(_))) {
+            keyframes = keyframes.or(crate::tweens::motion_menu(ui, ed));
+            continue;
+        }
         for &(label, keys, action) in block {
             item(ui, label, keys, action);
         }
     }
     ui.separator();
     item(ui, "Actions", "F9", None);
-    picked
+    picked.or(keyframes)
 }
 
 /// The layer context menu (docs/animate-ui-interaction.md §2.5), with what
@@ -1865,18 +1987,18 @@ fn layer_menu(ui: &mut Ui, ed: &Editor) -> Option<Action> {
         ui.separator();
     }
     item(ui, "Guide", Some(ToggleGuide), Some(kind == Some(LayerKind::Guide)));
-    item(ui, "Add Classic Motion Guide", None, None);
+    item(ui, "Add Classic Motion Guide", Some(AddMotionGuide), None);
     ui.separator();
-    item(ui, "Mask", None, Some(kind == Some(LayerKind::Mask)));
-    item(ui, "Show Masking", None, None);
+    item(ui, "Mask", Some(ToggleMask), Some(kind == Some(LayerKind::Mask)));
+    item(ui, "Show Masking", Some(ShowMasking), None);
     ui.separator();
     item(ui, "Insert Folder", Some(NewFolder), None);
     item(ui, "Delete Folders", folders_only.then_some(DeleteLayer), None);
-    item(ui, "Expand Folders", None, None);
-    item(ui, "Collapse Folders", None, None);
+    item(ui, "Expand Folders", Some(ExpandFolders), None);
+    item(ui, "Collapse Folders", Some(CollapseFolders), None);
     ui.separator();
-    item(ui, "Expand All Folders", None, None);
-    item(ui, "Collapse All Folders", None, None);
+    item(ui, "Expand All Folders", Some(ExpandAllFolders), None);
+    item(ui, "Collapse All Folders", Some(CollapseAllFolders), None);
     ui.separator();
     item(ui, "Properties...", Some(LayerProperties), None);
     picked
@@ -1956,6 +2078,11 @@ fn layer_properties(ctx: &egui::Context, ed: &mut Editor) {
         // OK with nothing changed is no undo step.
         let sel = ed.selection.clone();
         ed.edit_timeline(|_, tl| {
+            // A mask or guide made another kind lets its layers go.
+            if tl.layers.get(d.layer).is_some_and(|l| l.kind != d.kind) {
+                tl.set_mask(d.layer, false);
+                tl.set_guide(d.layer, false);
+            }
             if let Some(l) = tl.layers.get_mut(d.layer) {
                 let name = d.name.trim();
                 if !name.is_empty() {

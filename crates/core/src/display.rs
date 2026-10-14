@@ -5,9 +5,11 @@ use std::collections::BTreeSet;
 use std::f32::consts::{PI, TAU};
 
 use crate::doc::*;
+use crate::filters::Effects;
 use crate::hit::ElementRef;
 
 /// Something on stage, with its transform relative to the timeline's origin.
+#[derive(Clone)]
 pub struct Placed<'a> {
     pub item: Item<'a>,
     pub matrix: Matrix,
@@ -15,14 +17,23 @@ pub struct Placed<'a> {
     /// The element of the listed timeline that put this here. Graphic symbols
     /// and groups are flattened in, so one element can place several items.
     pub source: ElementRef,
+    /// A movie clip's, button's or text field's filters and Display settings.
+    pub effects: Effects,
 }
 
+#[derive(Clone)]
 pub enum Item<'a> {
     Shape(&'a Shape),
     /// Drawn as its glyphs' shape (text.rs).
     Text(&'a Text),
     /// A movie clip or button: it runs its own timeline.
     Clip(&'a Symbol, SymbolKind),
+    /// A shape tween's in-between, made for this frame (shape_tween.rs).
+    Morph(Box<Shape>),
+    /// A mask layer at work: `content`, the items of the layers it masks, shows only where
+    /// `mask`, its own items, covers. The mask itself isn't drawn. Placed at the identity: the
+    /// items carry their own transforms.
+    Masked { mask: Vec<Placed<'a>>, content: Vec<Placed<'a>> },
 }
 
 /// Bottom-to-top contents of `frame` of `tl`. Graphic symbols and groups are
@@ -36,6 +47,38 @@ pub fn display_list<'a>(doc: &'a Document, tl: &'a Timeline, frame: u32, skipped
 /// off), as the editor's stage shows them. Publishing still includes them.
 pub fn display_list_shown<'a>(doc: &'a Document, tl: &'a Timeline, frame: u32, skipped: &mut BTreeSet<String>) -> Vec<Placed<'a>> {
     list(doc, tl, frame, skipped, true)
+}
+
+/// `list` with each masked group replaced by what it masks: what there is to hit and
+/// to measure, as a mask draws nothing itself.
+pub fn unmasked(list: Vec<Placed<'_>>) -> Vec<Placed<'_>> {
+    let mut out = Vec::new();
+    for p in list {
+        match p.item {
+            Item::Masked { content, .. } => out.extend(unmasked(content)),
+            _ => out.push(p),
+        }
+    }
+    out
+}
+
+/// What layer `l` of the listed timeline puts in `list`, clipped by its mask if
+/// that's at work: one layer of the stage, as onion skinning draws them.
+pub fn layer_items(list: Vec<Placed<'_>>, l: usize) -> Vec<Placed<'_>> {
+    let mut out = Vec::new();
+    for p in list {
+        match p.item {
+            Item::Masked { mask, content } => {
+                let content: Vec<_> = content.into_iter().filter(|q| q.source.layer == l).collect();
+                if !content.is_empty() {
+                    out.push(Placed { item: Item::Masked { mask, content }, matrix: p.matrix, color: p.color, source: p.source, effects: p.effects });
+                }
+            }
+            _ if p.source.layer == l => out.push(p),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn list<'a>(doc: &'a Document, tl: &'a Timeline, frame: u32, skipped: &mut BTreeSet<String>, shown_only: bool) -> Vec<Placed<'a>> {
@@ -61,45 +104,117 @@ impl<'a> Lister<'a, '_> {
             self.skipped.insert("graphics nested over 32 deep".into());
             return;
         }
+        // Published, a mask always clips. The editor's stage shows a mask at work once it's
+        // locked, and clips each masked layer once that's locked too (Show Masking locks both);
+        // unlocked, each shows as it is, the mask's shape and all.
+        let editing = self.shown_only && depth == 0;
+        let at_work = |l: usize| !editing || tl.layers[l].locked();
+        // The masked layers listed so far: their mask, and where their items start in `out`.
+        let mut masked: Option<(usize, usize)> = None;
         for (l, layer) in tl.layers.iter().enumerate().rev() {
-            if self.shown_only && depth == 0 && !layer.visible() {
+            if editing && !layer.visible() {
                 continue;
             }
             match layer.kind {
-                LayerKind::Normal => {}
+                LayerKind::Normal | LayerKind::Mask => {}
+                // A guide shows on the stage of the timeline being edited, and never publishes.
+                LayerKind::Guide if editing => {}
                 LayerKind::Guide | LayerKind::Folder => continue,
-                // ponytail: masks aren't applied, so masked layers show unclipped. SWF has clip_depth for this.
-                LayerKind::Mask => {
-                    self.skipped.insert("mask layers".into());
-                    continue;
-                }
             }
-            let Some(i) = layer.keyframe_at(frame) else { continue };
+            if let Some(mask) = tl.mask_of(l).filter(|&mask| at_work(mask) && at_work(l))
+                && masked.is_none_or(|(by, _)| by != mask)
+            {
+                masked = Some((mask, self.out.len()));
+            }
+            // A mask at work gathers its items, and its masked layers', into a group: empty, it hides them.
+            let (start, mask) = (self.out.len(), layer.kind == LayerKind::Mask && at_work(l));
+            let Some(i) = layer.keyframe_at(frame) else {
+                if mask {
+                    self.mask(l, start, &mut masked, depth, &at_work);
+                }
+                continue;
+            };
             let key = &layer.frames[i];
             let offset = frame - key.index;
             if let Tween::Unsupported(kind) = &key.tween {
                 self.skipped.insert(format!("{kind} tweens"));
             }
-            let tweened = tween_at(key, layer.frames.get(i + 1), offset);
-            for (e, el) in key.elements.iter().enumerate() {
+            // Along a motion guide, and after the layer this one's parented to.
+            let (tweened, rig) = crate::layer_motion::motion(tl, l, i, offset);
+            let m = m * rig;
+            // A shape tween shows an in-between of its own; a motion tween moves its text too.
+            if let Some(shape) = crate::shape_tween::at(key, layer.frames.get(i + 1), offset) {
                 if depth == 0 {
-                    self.source = ElementRef { layer: l, keyframe: i, element: e };
+                    self.source = ElementRef { layer: l, keyframe: i, element: 0 };
                 }
-                // A tween only starts from a keyframe holding one instance, and replaces it.
-                match &tweened {
-                    Some(inst) => self.instance(inst, offset, m, cx, depth),
-                    None => self.element(el, offset, m, cx, depth),
+                self.out.push(Placed { item: Item::Morph(Box::new(shape)), matrix: m, color: cx, source: self.source, effects: Effects::default() });
+            } else {
+                let moved = crate::motion::text_at(key, offset);
+                for (e, el) in key.elements.iter().enumerate() {
+                    if depth == 0 {
+                        self.source = ElementRef { layer: l, keyframe: i, element: e };
+                    }
+                    // A tween only starts from a keyframe holding one instance, and replaces it.
+                    match (&tweened, el) {
+                        (Some(inst), _) => self.instance(inst, offset, m, cx, depth),
+                        (None, Element::Text(t)) if let Some(at) = moved => {
+                            self.out.push(Placed { item: Item::Text(t), matrix: m * at, color: cx, source: self.source, effects: Effects::of(&t.extra) })
+                        }
+                        (None, _) => self.element(el, offset, m, cx, depth),
+                    }
                 }
             }
+            if mask {
+                self.mask(l, start, &mut masked, depth, &at_work);
+            }
+        }
+    }
+
+    /// Mask layer `l`'s items, listed from `start` on, become a masked group with
+    /// the items its masked layers listed before them. On the stage, a masked layer
+    /// that isn't `at_work` (unlocked) over ones that are shows as it is, between groups.
+    fn mask(&mut self, l: usize, start: usize, masked: &mut Option<(usize, usize)>, depth: u32, at_work: &dyn Fn(usize) -> bool) {
+        let mask = self.out.split_off(start);
+        let content = match masked.take() {
+            Some((by, from)) if by == l => self.out.split_off(from),
+            other => {
+                *masked = other;
+                Vec::new()
+            }
+        };
+        let source = if depth == 0 { ElementRef { layer: l, keyframe: 0, element: 0 } } else { self.source };
+        let clipped = |p: &Placed| depth > 0 || at_work(p.source.layer);
+        let mut content = content.into_iter().peekable();
+        while let Some(p) = content.next() {
+            if !clipped(&p) {
+                self.out.push(p);
+                continue;
+            }
+            let mut run = vec![p];
+            while let Some(q) = content.next_if(clipped) {
+                run.push(q);
+            }
+            let item = Item::Masked { mask: mask.clone(), content: run };
+            self.out.push(Placed { item, matrix: Matrix::IDENTITY, color: ColorTransform::IDENTITY, source, effects: Effects::default() });
         }
     }
 
     fn element(&mut self, el: &'a Element, offset: u32, m: Matrix, cx: ColorTransform, depth: u32) {
         match el {
-            Element::Shape(s) => {
-                self.out.push(Placed { item: Item::Shape(s), matrix: m * s.matrix, color: cx, source: self.source })
-            }
-            Element::Text(t) => self.out.push(Placed { item: Item::Text(t), matrix: m * t.matrix, color: cx, source: self.source }),
+            Element::Shape(s) => self.out.push(Placed {
+                item: Item::Shape(s),
+                matrix: m * s.matrix,
+                color: cx,
+                source: self.source,
+                effects: Effects::default(),
+            }),
+            Element::Text(t) => self.out.push(Placed {
+                item: Item::Text(t),
+                matrix: m * t.matrix,
+                color: cx,
+                source: self.source,
+                effects: Effects::of(&t.extra),
+            }),
             Element::Instance(i) => self.instance(i, offset, m, cx, depth),
             Element::Group(members) => members.iter().for_each(|el| self.element(el, offset, m, cx, depth)),
             Element::Unsupported { name, .. } => {
@@ -116,7 +231,8 @@ impl<'a> Lister<'a, '_> {
         };
         let (m, cx) = (m * inst.matrix, cx * inst.color);
         if inst.kind != SymbolKind::Graphic {
-            self.out.push(Placed { item: Item::Clip(sym, inst.kind), matrix: m, color: cx, source: self.source });
+            let effects = Effects::of(&inst.extra);
+            self.out.push(Placed { item: Item::Clip(sym, inst.kind), matrix: m, color: cx, source: self.source, effects });
             return;
         }
         self.timeline(&sym.timeline, graphic_frame(inst, offset, &sym.timeline), m, cx, depth + 1);
@@ -133,9 +249,12 @@ pub(crate) fn graphic_frame(inst: &Instance, offset: u32, symbol: &Timeline) -> 
     }
 }
 
-/// The in-between instance `offset` frames into `key`'s classic tween, or None
-/// to show the keyframe as is.
+/// The in-between instance `offset` frames into `key`'s classic or motion tween,
+/// or None to show the keyframe as is.
 pub fn tween_at(key: &Frame, next: Option<&Frame>, offset: u32) -> Option<Instance> {
+    if let Some(Element::Instance(inst)) = crate::motion::target_at(key, offset) {
+        return Some(inst);
+    }
     let Tween::Classic { ease, rotate } = key.tween else { return None };
     // Like Animate, a broken tween (no next keyframe, or not one matching symbol each side) holds.
     let next = next.filter(|n| n.index == key.index + key.duration)?;
@@ -146,7 +265,13 @@ pub fn tween_at(key: &Frame, next: Option<&Frame>, offset: u32) -> Option<Instan
         return None;
     }
     let t = offset as f32 / key.duration as f32;
-    Some(lerp_instance(a, b, t + ease * t * (1.0 - t), rotate))
+    let t = t + ease * t * (1.0 - t);
+    let mut inst = lerp_instance(a, b, t, rotate);
+    // Filters tween too, kept in the in-between's XFL as the keyframes keep theirs.
+    if let Some(list) = crate::filters::tween(&a.extra, &b.extra, t) {
+        crate::filters::set_filters(&mut inst.extra, &list);
+    }
+    Some(inst)
 }
 
 /// Classic tween in-between: scale and skew angles interpolate separately and

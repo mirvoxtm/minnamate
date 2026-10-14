@@ -109,6 +109,8 @@ pub fn transform(ui: &mut Ui, ed: &mut Editor) {
     // A lone shape, instance or text shows its own numbers; a wider selection starts at 100% and 0°.
     let lone = match ed.selection[..] {
         [r] => match ed.element(r) {
+            // A motion tween's target, as it shows now.
+            Some(Element::Instance(_) | Element::Text(_)) if let Some(m) = crate::tweens::shown_matrix(ed, r) => Some(m),
             Some(Element::Shape(s)) => Some(s.matrix),
             Some(Element::Instance(i)) => Some(i.matrix),
             Some(Element::Text(t)) => Some(t.matrix),

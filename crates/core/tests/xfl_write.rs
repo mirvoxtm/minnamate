@@ -44,7 +44,8 @@ const SCRIPT: &str = "<Actionscript><script><![CDATA[if (a < b) stop();]]></scri
 const BITMAP: &str = r#"<DOMBitmapInstance libraryItemName="photo.png">
                   <matrix><Matrix tx="12" ty="3"/></matrix>
                 </DOMBitmapInstance>"#;
-const GRADIENT: &str = r##"<LinearGradient><GradientEntry color="#FF0000" ratio="0"/></LinearGradient>"##;
+// Gradients are read now (gradients.rs); bitmap fills are still kept as they were.
+const FILL: &str = r#"<BitmapFill bitmapPath="photo.png"><matrix><Matrix a="20" d="20"/></matrix></BitmapFill>"#;
 
 #[test]
 fn unread_xml_survives() {
@@ -61,7 +62,7 @@ fn unread_xml_survives() {
               <elements>
                 {BITMAP}
                 <DOMShape isDrawingObject="true">
-                  <fills><FillStyle index="1">{GRADIENT}</FillStyle></fills>
+                  <fills><FillStyle index="1">{FILL}</FillStyle></fills>
                   <edges><Edge fillStyle1="1" edges="!0 0|200 0|200 200|0 0"/></edges>
                 </DOMShape>
               </elements>
@@ -85,7 +86,7 @@ fn unread_xml_survives() {
 
     xfl_write::save(&doc, &dir.join("saved")).unwrap();
     let saved = fs::read_to_string(dir.join("saved/DOMDocument.xml")).unwrap();
-    let kept = [MEDIA, SCRIPT, BITMAP, GRADIENT, r#"xflVersion="2.97""#, r#"name="intro""#, r#"acceleration="-50""#];
+    let kept = [MEDIA, SCRIPT, BITMAP, FILL, r#"xflVersion="2.97""#, r#"name="intro""#, r#"acceleration="-50""#];
     for xml in kept {
         assert!(saved.contains(xml), "{xml} missing from\n{saved}");
     }

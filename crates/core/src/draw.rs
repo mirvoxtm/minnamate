@@ -17,6 +17,7 @@ pub fn add(frame: &mut Frame, shape: Shape) {
 /// A shape at identity with one edge holding `paths`. Without paths or styles it has no edges.
 /// Paths without segments are dropped, as the XFL reader does, and an end within a thousandth
 /// of a pixel of its start is pinned onto it, so rounding can't leave a closed outline open.
+/// A gradient fill or stroke is fitted to the shape's box.
 pub fn shape(mut paths: Vec<Path>, stroke: Option<Stroke>, fill: Option<Paint>) -> Shape {
     paths.retain(|p| !p.segs.is_empty());
     for p in &mut paths {
@@ -28,13 +29,15 @@ pub fn shape(mut paths: Vec<Path>, stroke: Option<Stroke>, fill: Option<Paint>) 
     }
     let visible = !paths.is_empty() && (stroke.is_some() || fill.is_some());
     let edge = Edge { fill0: 0, fill1: fill.is_some().into(), stroke: stroke.is_some().into(), paths };
-    Shape {
+    let mut shape = Shape {
         matrix: Matrix::IDENTITY,
         fills: fill.into_iter().collect(),
         strokes: stroke.into_iter().collect(),
         edges: if visible { vec![edge] } else { Vec::new() },
         extra: Extra::default(),
-    }
+    };
+    crate::gradient::fit_all(&mut shape);
+    shape
 }
 
 /// Rectangle Tool: the box with corners `rect`, in either order. A negative

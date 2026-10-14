@@ -183,7 +183,7 @@ const VIEW: &[Item] = &[
     ]),
     Sep,
     Do("Hide Edges", "Ctrl+Shift+E", Todo),
-    Do("Show Shape Hints", "Ctrl+Alt+I", Todo),
+    Do("Show Shape Hints", "Ctrl+Alt+I", Stage(Toggle::ShapeHints)),
     Do("Show Tab Order", "", Todo),
     Sep,
     Sub("Screen Mode", &[Do("Standard Screen Mode", "", Todo), Do("Full Screen Mode", "", Todo)]),
@@ -192,13 +192,14 @@ const VIEW: &[Item] = &[
 const INSERT: &[Item] = &[
     Do("New Symbol...", "Ctrl+F8", NewSymbol),
     Sep,
-    Do("Motion Tween", "", Todo),
-    Do("Shape Tween", "", Todo),
+    Do("Motion Tween", "", CreateMotionTween),
+    Do("Shape Tween", "", CreateShapeTween),
     Do("Classic Tween", "", CreateClassicTween),
     Sep,
     Sub("Timeline", &[
         Do("Layer", "", NewLayer),
         Do("Layer Folder", "", NewFolder),
+        Do("Classic Motion Guide", "", AddMotionGuide),
         Sep,
         Do("Frame", "F5", InsertFrame),
         // F6 and F7 turn every selected frame into a keyframe, as Animate does.
@@ -228,8 +229,8 @@ const MODIFY: &[Item] = &[
         Do("Expand Fill...", "", Todo),
         Do("Soften Fill Edges...", "", Todo),
         Sep,
-        Do("Add Shape Hint", "Ctrl+Shift+H", Todo),
-        Do("Remove All Hints", "", Todo),
+        Do("Add Shape Hint", "Ctrl+Shift+H", AddShapeHint),
+        Do("Remove All Hints", "", RemoveAllHints),
     ]),
     Sub("Combine Objects", &[
         Do("Delete Envelope", "", Todo),
@@ -494,6 +495,7 @@ fn enabled(ed: &Editor, action: Action) -> bool {
             // Shapes and text are as far apart as they go (arrange::broken_apart).
             BreakApart => ed.selection.iter().any(|&r| matches!(ed.element(r), Some(Element::Group(_) | Element::Instance(_)))),
             EditInPlace => lone_instance,
+            AddShapeHint | RemoveAllHints => crate::tweens::hint_available(ed, action),
             EditSymbol => !ed.editing.is_empty() || lone_instance,
             // First, Previous, Next and Last need another scene to go to, or a symbol to leave.
             GoToScene(go) => matches!(go, Go::To(_)) || ed.scene_at(go) != ed.scene || !ed.editing.is_empty(),

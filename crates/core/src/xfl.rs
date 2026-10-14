@@ -22,6 +22,7 @@ pub(crate) const SYMBOL_ATTRS: &[&str] = &["name", "symbolType"];
 pub(crate) const TIMELINE_ATTRS: &[&str] = &["name"];
 pub(crate) const LAYER_ATTRS: &[&str] = &["name", "layerType"];
 pub(crate) const INSTANCE_ATTRS: &[&str] = &["libraryItemName", "symbolType", "loop", "firstFrame"];
+pub(crate) const GRADIENT_ATTRS: &[&str] = &["spreadMethod", "interpolationMethod", "focalPointRatio"];
 /// `bitmapSize` follows `size`, and `lineHeight` the font, so neither is kept to go stale.
 pub(crate) const TEXT_RUN_ATTRS: &[&str] = &[
     "alignment", "letterSpacing", "lineSpacing", "size", "bitmapSize", "lineHeight", "face", "fillColor", "alpha", "bold",
@@ -37,12 +38,14 @@ pub(crate) fn text_attrs(kind: TextKind, fixed: bool) -> &'static [&'static str]
     }
 }
 
-/// Only a classic tween reads the tween settings, so a shape tween keeps its ease in `extra`.
+/// The tween settings each kind of tween reads; another kind's stay in `extra`.
 pub(crate) fn frame_attrs(tween: &Tween) -> &'static [&'static str] {
     match tween {
         Tween::Classic { .. } => {
             &["index", "duration", "tweenType", "acceleration", "motionTweenRotate", "motionTweenRotateTimes"]
         }
+        Tween::Motion(_) => &["index", "duration", "tweenType", "motionTweenRotate", "motionTweenRotateTimes"],
+        Tween::Shape { .. } => &["index", "duration", "tweenType", "acceleration", "shapeTweenBlend", "shapeHints"],
         _ => &["index", "duration", "tweenType"],
     }
 }
@@ -130,6 +133,7 @@ fn layer(n: Node) -> Result<Layer> {
 }
 
 fn frame(n: Node) -> Result<Frame> {
+    let duration = num(n, "duration", 1u32)?.max(1);
     // Assumptions to check against real Animate files: `acceleration` has the
     // sign of the Ease field (+ = out), and a missing rotate count means 1.
     let tween = match n.attribute("tweenType") {
@@ -142,11 +146,23 @@ fn frame(n: Node) -> Result<Frame> {
                 _ => Rotate::Auto,
             },
         },
+        // The motion XML stays in `extra` too, written back while the tween is as read; one
+        // the model can't read leaves the tween unsupported, rather than the document unread.
+        Some("motion object") => match crate::motion::read(n, duration) {
+            Ok(m) => Tween::Motion(Box::new(m)),
+            Err(_) => Tween::Unsupported("motion object".into()),
+        },
+        // ponytail: `shapeTweenBlend` is JSFL's name for the blend; unconfirmed in Animate's XFL.
+        Some("shape") => Tween::Shape {
+            ease: num::<f32>(n, "acceleration", 0.0)? / 100.0,
+            angular: n.attribute("shapeTweenBlend") == Some("angular"),
+            hints: n.attribute("shapeHints").and_then(|h| crate::shape_tween::read_hints(h).ok()).unwrap_or_default(),
+        },
         Some(other) => Tween::Unsupported(other.into()),
     };
     Ok(Frame {
         index: num(n, "index", 0)?,
-        duration: num(n, "duration", 1u32)?.max(1),
+        duration,
         elements: list(n, "elements").map(element).collect::<Result<_>>()?,
         extra: extra(n, frame_attrs(&tween), &["elements"]),
         tween,
@@ -238,7 +254,35 @@ fn paint(n: Node) -> Result<Paint> {
             let [r, g, b] = hex_color(p.attribute("color").unwrap_or("#000000"))?;
             Paint::Solid([r, g, b, num(p, "alpha", 1.0)?])
         }
+        "LinearGradient" | "RadialGradient" => Paint::Gradient(gradient(p)?),
         other => Paint::Unsupported { name: other.into(), xml: source(p) },
+    })
+}
+
+/// A `<LinearGradient>` or `<RadialGradient>`: its matrix and `<GradientEntry>` stops.
+// ponytail: a GradientEntry's attributes other than color, alpha and ratio aren't kept; give
+// stops an Extra if Animate writes others.
+fn gradient(n: Node) -> Result<Gradient> {
+    let kind = match n.tag_name().name() {
+        "RadialGradient" => GradientKind::Radial { focal: num(n, "focalPointRatio", 0.0)? },
+        _ => GradientKind::Linear,
+    };
+    let mut stops = Vec::new();
+    for e in n.children().filter(|c| c.tag_name().name() == "GradientEntry") {
+        let [r, g, b] = hex_color(e.attribute("color").unwrap_or("#000000"))?;
+        stops.push((num(e, "ratio", 0.0)?, [r, g, b, num(e, "alpha", 1.0)?]));
+    }
+    Ok(Gradient {
+        kind,
+        matrix: matrix(n)?,
+        stops,
+        spread: match n.attribute("spreadMethod") {
+            Some("reflect") => Spread::Reflect,
+            Some("repeat") => Spread::Repeat,
+            _ => Spread::Pad,
+        },
+        linear_rgb: n.attribute("interpolationMethod") == Some("linearRGB"),
+        extra: extra(n, GRADIENT_ATTRS, &["matrix", "GradientEntry"]),
     })
 }
 
@@ -395,7 +439,7 @@ fn twips(token: &str) -> Result<f64> {
     Ok(bits as i32 as f64 / 256.0)
 }
 
-fn hex_color(s: &str) -> Result<[f32; 3]> {
+pub(crate) fn hex_color(s: &str) -> Result<[f32; 3]> {
     let v = u32::from_str_radix(s.trim_start_matches('#'), 16).map_err(|e| format!("color {s:?}: {e}"))?;
     Ok([v >> 16, v >> 8, v].map(|c| (c & 0xFF) as f32 / 255.0))
 }

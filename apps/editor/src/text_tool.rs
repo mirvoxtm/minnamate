@@ -210,6 +210,8 @@ pub fn edit_at(ed: &mut Editor, r: ElementRef, at: Point) {
 /// Starts typing in text `r` of the edited timeline, the caret nearest `at`.
 fn edit(ed: &mut Editor, r: ElementRef, at: Point) {
     let Some(Element::Text(t)) = element(ed, r).cloned() else { return };
+    // A motion tween's text is typed in where it shows (`write` keeps its own place).
+    let t = Text { matrix: crate::tweens::shown_matrix(ed, r).unwrap_or(t.matrix), ..t };
     // Properties shows the text's style, and the fill its color, as in Animate.
     if let Some(run) = t.runs.first() {
         ed.text.face = run.face.clone();
@@ -266,7 +268,7 @@ fn new_run(ed: &Editor) -> TextRun {
 /// undo the text isn't what was typed: that stops it, leaving the document be.
 fn check(ed: &mut Editor) {
     let Some(s) = &ed.text.editing else { return };
-    let intact = s.target.is_none_or(|r| matches!(element(ed, r), Some(Element::Text(t)) if *t == s.text));
+    let intact = s.target.is_none_or(|r| matches!(element(ed, r), Some(Element::Text(t)) if *t == held(ed, r, s)));
     if !intact {
         ed.text.editing = None;
     } else if s.frame != ed.frame || s.depth != ed.editing.len() {
@@ -281,7 +283,7 @@ pub fn commit(ed: &mut Editor) {
     if let Some(r) = s.target
         && s.text.kind == TextKind::Static
         && text::string(&s.text).is_empty()
-        && matches!(element(ed, r), Some(Element::Text(t)) if *t == s.text)
+        && matches!(element(ed, r), Some(Element::Text(t)) if *t == held(ed, r, &s))
     {
         ed.checkpoint_gesture("text");
         if let Some(key) = ed.timeline_mut().layers.get_mut(r.layer).and_then(|l| l.frames.get_mut(r.keyframe)) {
@@ -394,6 +396,7 @@ fn write(ed: &mut Editor) {
     let (target, text, layer) = (s.target, s.text.clone(), s.layer);
     match target {
         Some(r) => {
+            let text = held(ed, r, s);
             ed.checkpoint_gesture("text");
             if let Some(el) = ed.element_mut(r) {
                 *el = Element::Text(text);
@@ -427,6 +430,14 @@ fn add(ed: &mut Editor, l: usize, text: Text) -> Option<ElementRef> {
 
 fn element(ed: &Editor, r: ElementRef) -> Option<&Element> {
     ed.timeline().layers.get(r.layer)?.frames.get(r.keyframe)?.elements.get(r.element)
+}
+
+/// The text being typed as text `r` holds it: a motion tween's, typed where it shows, keeps its own place.
+fn held(ed: &Editor, r: ElementRef, s: &Session) -> Text {
+    match element(ed, r) {
+        Some(Element::Text(own)) if minnamate_core::motion::tweening(ed.timeline(), r, s.frame) => Text { matrix: own.matrix, ..s.text.clone() },
+        _ => s.text.clone(),
+    }
 }
 
 /// Applies a Properties change to the text being typed, every run of it.
