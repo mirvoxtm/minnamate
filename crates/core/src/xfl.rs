@@ -91,12 +91,17 @@ fn read_document(read: &mut dyn FnMut(&str) -> Result<String>) -> Result<Documen
     }
 
     let [r, g, b] = hex_color(root.attribute("backgroundColor").unwrap_or("#FFFFFF"))?;
+    // A document has a scene at least: everything that shows one takes the first.
+    let scenes: Vec<Timeline> = list(root, "timelines").map(timeline_of).collect::<Result<_>>()?;
+    if scenes.is_empty() {
+        return Err("DOMDocument.xml: no timelines".into());
+    }
     Ok(Document {
         width: num(root, "width", 550.0)?,
         height: num(root, "height", 400.0)?,
         frame_rate: num(root, "frameRate", 24.0)?,
         background: [r, g, b, 1.0],
-        scenes: list(root, "timelines").map(timeline_of).collect::<Result<_>>()?,
+        scenes,
         library,
         extra: extra(root, DOCUMENT_ATTRS, &["symbols", "timelines"]),
     })
@@ -528,6 +533,12 @@ mod tests {
         let Element::Text(t) = parse_element(dynamic) else { panic!("not text") };
         assert_eq!((t.kind, t.width), (TextKind::Dynamic, None));
         assert_eq!(t.extra.attrs, kept(&[("lineType", "multiline")]));
+    }
+
+    #[test]
+    fn a_document_needs_a_scene() {
+        let xml = r#"<DOMDocument xmlns="http://ns.adobe.com/xfl/2008/" width="550" height="400"><timelines/></DOMDocument>"#;
+        assert!(read_document(&mut |_| Ok(xml.into())).is_err());
     }
 
     #[test]

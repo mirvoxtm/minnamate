@@ -110,7 +110,7 @@ impl State {
     /// the commands that open, create, save or close one work.
     pub fn allows(&self, action: Action) -> bool {
         match action {
-            Action::New | Action::CreateDocument | Action::Open | Action::OpenRecent(_) | Action::Exit | Action::About => true,
+            Action::New | Action::CreateDocument | Action::Open | Action::OpenDropped | Action::OpenRecent(_) | Action::Exit | Action::About => true,
             Action::Close | Action::Save | Action::SaveAs | Action::ShowDocument => self.doc_open,
             _ => !self.shown,
         }

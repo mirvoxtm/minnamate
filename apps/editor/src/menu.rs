@@ -485,7 +485,7 @@ fn enabled(ed: &Editor, action: Action) -> bool {
             Todo => false,
             Undo => ed.can_undo(),
             Redo => ed.can_redo(),
-            PasteInCenter | PasteInPlace => !ed.clipboard.is_empty() && ed.pasteable_layer(),
+            PasteInCenter | PasteInPlace => !ed.clipboard.is_empty() && ed.drawable(),
             Cut | Copy | DeleteSelection | Duplicate | Group | Arrange(_) | Align(_) | RemoveTransform | ScaleAndRotate
             | FlipHorizontal | FlipVertical | Rotate90Cw | Rotate90Ccw => picked,
             // It converts on a scene's timeline only (convert_symbol::open).
@@ -761,7 +761,8 @@ fn window_buttons(ui: &mut Ui, maximized: bool) {
             ui.painter().rect_filled(rect, 0.0, hover);
         }
         let color = if close && resp.hovered() { Color32::WHITE } else { theme::TEXT };
-        icons::paint(ui.painter(), Rect::from_center_size(rect.center(), vec2(14.0, 14.0)), icon, color);
+        // At 18 px the glyphs are on whole pixels: 10 px, in 1 px lines.
+        icons::paint(ui.painter(), Rect::from_center_size(rect.center(), vec2(18.0, 18.0)), icon, color);
         if resp.on_hover_text(tip).clicked() {
             ui.ctx().send_viewport_cmd(command);
         }

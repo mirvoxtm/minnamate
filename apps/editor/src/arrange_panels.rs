@@ -373,7 +373,7 @@ fn scale_and_rotate(ctx: &egui::Context, ed: &mut Editor) {
         ui.add_space(12.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
             cancel |= ui.button("  Cancel  ").clicked();
-            ok |= ui.button("    OK    ").clicked();
+            ok |= theme::cta_button(ui, "    OK    ").clicked();
         });
     });
     ed.scale_rotate = Some((scale, turn));

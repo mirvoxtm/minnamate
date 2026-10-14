@@ -472,7 +472,7 @@ fn parts(icon: Icon) -> Vec<Part> {
         Icon::ChevronDown => vec![Line("M5 7 L9 11 L13 7", 1.4)],
         Icon::ChevronsRight => vec![Line("M4 5 L8 9 L4 13 M9.5 5 L13.5 9 L9.5 13", 1.3)],
         Icon::ChevronsLeft => vec![Line("M14 5 L10 9 L14 13 M8.5 5 L4.5 9 L8.5 13", 1.3)],
-        Icon::WinMinimize => vec![Line("M4 9 H14", 1.0)],
+        Icon::WinMinimize => vec![Line("M4.5 9.5 H13.5", 1.0)],
         Icon::WinMaximize => vec![Line("M4.5 4.5 H13.5 V13.5 H4.5 Z", 1.0)],
         Icon::WinRestore => vec![Line("M4.5 6.5 H11.5 V13.5 H4.5 Z M6.5 6.5 V4.5 H13.5 V11.5 H11.5", 1.0)],
         Icon::WinClose => vec![Line("M4.5 4.5 L13.5 13.5 M13.5 4.5 L4.5 13.5", 1.0)],
@@ -667,7 +667,10 @@ fn rasterize(icon: Icon, px: u32) -> ColorImage {
 }
 
 fn draw(pm: &mut Pixmap, parts: Vec<Part>, ts: Transform, paint: &sk::Paint) {
-    let stroke = |width: f32| sk::Stroke { width, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Default::default() };
+    // No line thinner than a device pixel, or a small glyph fades away.
+    let (sx, sy) = ts.get_scale();
+    let thinnest = 1.0 / sx.min(sy);
+    let stroke = |width: f32| sk::Stroke { width: width.max(thinnest), line_cap: LineCap::Round, line_join: LineJoin::Round, ..Default::default() };
     for part in parts {
         match part {
             Fill(d) => {
@@ -888,6 +891,31 @@ mod tests {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/screenshots");
         std::fs::create_dir_all(&dir).unwrap();
         h.render().expect("render").save(dir.join("icons.png")).unwrap();
+    }
+
+    #[test]
+    fn small_glyphs_keep_whole_pixel_strokes() {
+        // As small as the chrome draws them (the zoom field's caret, dock and
+        // floating-panel chevrons, a floating panel's close box, the Share
+        // popover's chevrons), and smaller. A 1 px line's most-covered pixel is
+        // over 60% inked even on a diagonal; thinner lines faded to half or less.
+        let small = [
+            (Icon::ChevronDown, 6),
+            (Icon::ChevronDown, 10),
+            (Icon::ChevronsLeft, 8),
+            (Icon::ChevronsRight, 8),
+            (Icon::ChevronLeft, 10),
+            (Icon::ChevronRight, 10),
+            (Icon::WinClose, 10),
+            (Icon::ChevronLeft, 12),
+            (Icon::ChevronRight, 12),
+        ];
+        let peaks = small.map(|(icon, px)| (icon, px, rasterize(icon, px).pixels.iter().map(|p| p.a()).max().unwrap()));
+        assert!(peaks.iter().all(|p| p.2 >= 150), "{peaks:?}");
+        // The window's Minimize, at its 18 px: one crisp row.
+        let img = rasterize(Icon::WinMinimize, 18);
+        let rows: Vec<usize> = (0..18).filter(|&y| (0..18).any(|x| img.pixels[y * 18 + x].a() > 0)).collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
     }
 
     #[test]

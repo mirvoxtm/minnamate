@@ -80,6 +80,31 @@ fn check_name(doc: &Document, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether `elements` draw symbol `name`: one is an instance of it, or of a
+/// symbol drawing it at any depth. Inside `name` they'd draw it in itself
+/// without end, so pasting there refuses them.
+// ponytail: a file already holding a symbol inside itself still draws it 32 deep (display.rs);
+// keeping the symbols being drawn on a stack there would stop that.
+pub fn draws<'a>(doc: &'a Document, elements: impl IntoIterator<Item = &'a Element>, name: &str) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut todo: Vec<&Element> = elements.into_iter().collect();
+    while let Some(el) = todo.pop() {
+        match el {
+            Element::Instance(i) if i.symbol == name => return true,
+            Element::Instance(i) => {
+                if seen.insert(&i.symbol)
+                    && let Some(s) = doc.library.get(&i.symbol)
+                {
+                    todo.extend(s.timeline.layers.iter().flat_map(|l| &l.frames).flat_map(|k| &k.elements));
+                }
+            }
+            Element::Group(members) => todo.extend(members),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// The first "Symbol N" name the library doesn't use yet, as Animate suggests.
 pub fn next_symbol_name(doc: &Document) -> String {
     (1..).map(|n| format!("Symbol {n}")).find(|n| !doc.library.contains_key(n)).unwrap_or_default()
@@ -129,6 +154,24 @@ mod tests {
         assert!(convert_to_symbol(&mut doc, 0, 0, &r, "Symbol 1", SymbolKind::Graphic, (0.0, 0.0)).is_err());
         assert!(convert_to_symbol(&mut doc, 0, 0, &r, "  ", SymbolKind::Graphic, (0.0, 0.0)).is_err());
         assert!(new_symbol(&mut doc, "Symbol 1", SymbolKind::Graphic).is_err());
+    }
+
+    #[test]
+    fn what_draws_a_symbol() {
+        let mut doc = Document::new(100.0, 100.0, 24.0);
+        new_symbol(&mut doc, "A", SymbolKind::Graphic).unwrap();
+        new_symbol(&mut doc, "B", SymbolKind::Graphic).unwrap();
+        let instance = |symbol: &str| {
+            let (matrix, color, looping) = (Matrix::IDENTITY, ColorTransform::IDENTITY, Loop::Loop);
+            let kind = SymbolKind::Graphic;
+            Element::Instance(Instance { symbol: symbol.into(), kind, matrix, pivot: (0.0, 0.0), color, looping, first_frame: 0, extra: Extra::default() })
+        };
+        // B holds A in a group; A holds itself already, as a file might.
+        for (s, el) in [("B", Element::Group(vec![instance("A")])), ("A", instance("A"))] {
+            doc.library.get_mut(s).unwrap().timeline.layers[0].frames[0].elements.push(el);
+        }
+        assert!(draws(&doc, &[instance("B")], "A"), "through B");
+        assert!(!draws(&doc, &[instance("A")], "B"), "A's loop ends");
     }
 
     #[test]

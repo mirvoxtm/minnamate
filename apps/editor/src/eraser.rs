@@ -218,8 +218,11 @@ fn faucet(ed: &mut Editor, p: Point) {
 /// Copies of the drawn shapes the eraser reaches at the playhead, topmost first.
 fn targets(ed: &Editor, selected_only: bool) -> Vec<(ElementRef, Shape)> {
     let layers = &ed.timeline().layers;
-    // We have no locked or hidden layers yet; guides and masks aren't shown on stage.
-    let reached = |l: usize| layers[l].kind == LayerKind::Normal && (l == ed.layer || !ed.eraser.active_layer);
+    // Shown, unlocked normal layers: guides and masks don't show on stage.
+    let reached = |l: usize| {
+        let layer = &layers[l];
+        layer.kind == LayerKind::Normal && layer.visible() && !layer.locked() && (l == ed.layer || !ed.eraser.active_layer)
+    };
     let shape = |r: &ElementRef| match &layers[r.layer].frames[r.keyframe].elements[r.element] {
         Element::Shape(s) => Some(s.clone()),
         _ => None,

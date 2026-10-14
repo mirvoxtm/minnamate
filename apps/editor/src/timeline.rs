@@ -13,6 +13,7 @@ use eframe::egui::{
 };
 use minnamate_core::doc::{Frame, Layer, LayerKind, Rgba, Timeline, Tween};
 use minnamate_core::hit::ElementRef;
+use minnamate_core::symbols;
 
 use crate::app::{Action, Editor, PanelId, PropsTab};
 use crate::icons::{self, Icon};
@@ -64,6 +65,9 @@ pub struct State {
     /// Where Shift+click extends the selection from.
     anchor: (usize, u32),
     drag: Option<Drag>,
+    /// The document revision and scene the gesture started on: a key changing
+    /// them mid-drag ends it (see `track`).
+    drag_on: (u32, usize),
     /// The cell last right-clicked, which the frame menu is about.
     menu_cell: (usize, u32),
     /// Cut or copied frames: a keyframe list per layer, and how many frames they span.
@@ -96,6 +100,7 @@ impl Default for State {
             sel_at: None,
             anchor: (0, 0),
             drag: None,
+            drag_on: (0, 0),
             menu_cell: (0, 0),
             clip: None,
             layer_clip: Vec::new(),
@@ -261,8 +266,9 @@ fn output(ui: &mut Ui, ed: &Editor) {
 }
 
 /// A toolbar button centered at `center`: a 28 px hit box with a 14 px glyph,
-/// a chip behind it while toggled on, and a corner triangle for grouped
-/// buttons, which also sense drags so a long press stays down (`group_menu`).
+/// a chip behind it while toggled on (and pressed while its menu is open), and
+/// a corner triangle for grouped buttons, which also sense drags so a long
+/// press stays down (`group_menu`).
 fn button_at(ui: &mut Ui, center: Pos2, icon: Icon, tooltip: &str, toggled: bool, enabled: bool, grouped: bool) -> Response {
     let rect = Rect::from_center_size(center, vec2(28.0, 28.0));
     let sense = match (enabled, grouped) {
@@ -271,8 +277,10 @@ fn button_at(ui: &mut Ui, center: Pos2, icon: Icon, tooltip: &str, toggled: bool
         (true, true) => Sense::click_and_drag(),
     };
     let resp = ui.interact(rect, ui.id().with(("tl-button", tooltip)), sense);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tooltip));
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
     let p = ui.painter();
-    if enabled && resp.is_pointer_button_down_on() {
+    if enabled && (resp.is_pointer_button_down_on() || open) {
         p.rect_filled(rect.expand(1.0), 4.0, theme::BUTTON_ACTIVE);
     } else if toggled {
         p.rect_filled(rect.expand(1.0), 4.0, theme::TOGGLED);
@@ -344,73 +352,103 @@ fn toolbar(ui: &mut Ui, ed: &mut Editor) {
     button_at(ui, pos2(column_right - 28.0, cy), Icon::TlLayerDepth, "Layer Depth", false, false, false);
     p.vline(column_right, bar.y_range(), Stroke::new(1.0, theme::BORDER));
 
-    // Frame block: the rate and current-frame readouts.
-    let mut x = column_right + 35.0;
-    x += readout(&p, pos2(x, cy), &format!("{:.2}", ed.doc.frame_rate), "FPS", READOUT) + 14.0;
-    readout(&p, pos2(x, cy), &(ed.frame + 1).to_string(), "F", theme::CURRENT_FRAME_TEXT);
-
-    // The centered cluster: keyframes | onion, edit multiple, tween, center | loop and transport.
+    // Frame block: the readouts at the left, the cluster centered and the zoom
+    // controls at the right. Short of room, the zoom controls go first, then
+    // the readouts, the cluster's middle group and its keyframe group, so no
+    // control is drawn over another.
+    // ponytail: what goes has no overflow menu; its keys and menus still work.
     const PITCH: f32 = 30.0;
     const DIVIDER: f32 = 37.0;
-    let width = 11.0 * PITCH + 2.0 * DIVIDER;
-    let mut cx = (column_right + bar.right()) / 2.0 - width / 2.0 + PITCH / 2.0;
+    // The readouts' room ("24.00 FPS", then up to "1234 F"), the zoom controls'
+    // from the bar's right end, and the space kept from both.
+    const READOUTS_W: f32 = 130.0;
+    const ZOOM_W: f32 = 148.0;
+    const GAP: f32 = 4.0;
+    // With `gone` of those given way: where the cluster may go, and its width.
+    let span = |gone: u32| {
+        let lo = column_right + if gone < 2 { READOUTS_W + GAP } else { 1.0 };
+        let hi = bar.right() - if gone < 1 { ZOOM_W + GAP } else { 1.0 };
+        let (middle, keys) = ((gone < 3) as u32, (gone < 4) as u32);
+        (lo, hi, PITCH * (4 + 4 * middle + 3 * keys) as f32 + DIVIDER * (middle + keys) as f32)
+    };
+    let gone = (0..4)
+        .find(|&gone| {
+            let (lo, hi, width) = span(gone);
+            hi - lo >= width
+        })
+        .unwrap_or(4);
+    let (lo, hi, width) = span(gone);
+
+    if gone < 2 {
+        let p = p.with_clip_rect(Rect::from_x_y_ranges(column_right..=column_right + READOUTS_W, bar.y_range()));
+        let mut x = column_right + 35.0;
+        x += readout(&p, pos2(x, cy), &format!("{:.2}", ed.doc.frame_rate), "FPS", READOUT) + 14.0;
+        readout(&p, pos2(x, cy), &(ed.frame + 1).to_string(), "F", theme::CURRENT_FRAME_TEXT);
+    }
+
+    // The cluster: keyframes | onion, edit multiple, tween, center | loop and transport.
+    let mut cx = ((column_right + bar.right()) / 2.0 - width / 2.0).min(hi - width).max(lo) + PITCH / 2.0;
     let mut next = |gap: f32| {
         let at = cx;
         cx += gap;
         pos2(at, cy)
     };
-    let (prev_key, next_key) = keyframe_neighbors(ed);
-    if button_at(ui, next(PITCH), Icon::ChevronLeft, "Go to Previous Keyframe (Alt+,)", false, prev_key.is_some(), false).clicked() {
-        action = Some(Action::PrevKeyframe);
-    }
-    let key_icon = match ed.key_command {
-        Action::ConvertToBlankKeyframes => Icon::TlBlankKeyframe,
-        Action::InsertFrame => Icon::TlFrame,
-        _ => Icon::TlKeyframe,
-    };
-    let key = button_at(ui, next(PITCH), key_icon, "Insert Keyframe (hold for more)", false, true, true);
-    if key.clicked() {
-        action = Some(ed.key_command);
-    }
-    group_menu(ui, &key, |ui| {
-        let commands = [("Keyframe", Action::ConvertToKeyframes), ("Blank Keyframe", Action::ConvertToBlankKeyframes), ("Frame", Action::InsertFrame)];
-        for (label, command) in commands {
-            if theme::menu_toggle(ui, true, ed.key_command == command, label).clicked() {
-                ed.key_command = command;
-                action = Some(command);
-            }
+    if gone < 4 {
+        let (prev_key, next_key) = keyframe_neighbors(ed);
+        if button_at(ui, next(PITCH), Icon::ChevronLeft, "Go to Previous Keyframe (Alt+,)", false, prev_key.is_some(), false).clicked() {
+            action = Some(Action::PrevKeyframe);
         }
-        ui.separator();
-        theme::menu_toggle(ui, false, false, "Auto KeyFrame");
-    });
-    let at = next(PITCH + DIVIDER);
-    if button_at(ui, at, Icon::ChevronRight, "Go to Next Keyframe (Alt+.)", false, next_key.is_some(), false).clicked() {
-        action = Some(Action::NextKeyframe);
+        let key_icon = match ed.key_command {
+            Action::ConvertToBlankKeyframes => Icon::TlBlankKeyframe,
+            Action::InsertFrame => Icon::TlFrame,
+            _ => Icon::TlKeyframe,
+        };
+        let key = button_at(ui, next(PITCH), key_icon, "Insert Keyframe (hold for more)", false, true, true);
+        if key.clicked() {
+            action = Some(ed.key_command);
+        }
+        group_menu(ui, &key, |ui| {
+            let commands = [("Keyframe", Action::ConvertToKeyframes), ("Blank Keyframe", Action::ConvertToBlankKeyframes), ("Frame", Action::InsertFrame)];
+            for (label, command) in commands {
+                if theme::menu_toggle(ui, true, ed.key_command == command, label).clicked() {
+                    ed.key_command = command;
+                    action = Some(command);
+                }
+            }
+            ui.separator();
+            theme::menu_toggle(ui, false, false, "Auto KeyFrame");
+        });
+        let at = next(PITCH + DIVIDER);
+        if button_at(ui, at, Icon::ChevronRight, "Go to Next Keyframe (Alt+.)", false, next_key.is_some(), false).clicked() {
+            action = Some(Action::NextKeyframe);
+        }
+        divider(&p, at.x + (PITCH + DIVIDER) / 2.0, cy);
     }
-    divider(&p, at.x + (PITCH + DIVIDER) / 2.0, cy);
-    let onion = button_at(ui, next(PITCH), Icon::TlOnion, "Onion Skin (hold for more)", ed.onion, true, true);
-    ed.tl.onion_button = onion.rect;
-    if onion.clicked() {
-        ed.onion = !ed.onion;
-    }
-    group_menu(ui, &onion, |ui| onion_menu(ui, ed));
-    button_at(ui, next(PITCH), Icon::TlEditMultiple, "Edit Multiple Frames", false, false, true);
-    let tween = button_at(ui, next(PITCH), Icon::TlClassicTween, "Create Classic Tween", false, true, true);
-    if tween.clicked() {
-        action = Some(Action::CreateClassicTween);
-    }
-    group_menu(ui, &tween, |ui| {
-        if theme::menu_toggle(ui, true, true, "Create classic tween").clicked() {
+    if gone < 3 {
+        let onion = button_at(ui, next(PITCH), Icon::TlOnion, "Onion Skin (hold for more)", ed.onion, true, true);
+        ed.tl.onion_button = onion.rect;
+        if onion.clicked() {
+            ed.onion = !ed.onion;
+        }
+        group_menu(ui, &onion, |ui| onion_menu(ui, ed));
+        button_at(ui, next(PITCH), Icon::TlEditMultiple, "Edit Multiple Frames", false, false, true);
+        let tween = button_at(ui, next(PITCH), Icon::TlClassicTween, "Create Classic Tween", false, true, true);
+        if tween.clicked() {
             action = Some(Action::CreateClassicTween);
         }
-        theme::menu_toggle(ui, false, false, "Create motion tween");
-        theme::menu_toggle(ui, false, false, "Create shape tween");
-    });
-    let at = next(PITCH + DIVIDER);
-    if button_at(ui, at, Icon::TlCenterFrame, "Center Frame", false, true, false).clicked() {
-        ed.center_frame = true;
+        group_menu(ui, &tween, |ui| {
+            if theme::menu_toggle(ui, true, true, "Create classic tween").clicked() {
+                action = Some(Action::CreateClassicTween);
+            }
+            theme::menu_toggle(ui, false, false, "Create motion tween");
+            theme::menu_toggle(ui, false, false, "Create shape tween");
+        });
+        let at = next(PITCH + DIVIDER);
+        if button_at(ui, at, Icon::TlCenterFrame, "Center Frame", false, true, false).clicked() {
+            ed.center_frame = true;
+        }
+        divider(&p, at.x + (PITCH + DIVIDER) / 2.0, cy);
     }
-    divider(&p, at.x + (PITCH + DIVIDER) / 2.0, cy);
     if button_at(ui, next(PITCH), Icon::TlLoop, "Loop", ed.loop_playback, true, false).clicked() {
         action = Some(Action::LoopPlayback);
     }
@@ -426,24 +464,26 @@ fn toolbar(ui: &mut Ui, ed: &mut Editor) {
     }
 
     // Right: reset zoom, the cell-width slider and its "large" end.
-    let right = bar.right() - 12.0;
-    icons::paint(&p, Rect::from_center_size(pos2(right - 9.0, cy), vec2(16.0, 12.0)), Icon::TlMountains, ICON_INK);
-    let track = Rect::from_min_max(pos2(right - 104.0, cy - 1.0), pos2(right - 24.0, cy + 1.0));
-    p.rect_filled(track, 1.0, theme::SLIDER_TRACK);
-    let t = (ed.cell_w - MIN_CELL_W) / (MAX_CELL_W - MIN_CELL_W);
-    let knob = pos2(track.left() + t * track.width(), cy);
-    let slider = ui.interact(track.expand2(vec2(6.0, 8.0)), ui.id().with("cell-width"), Sense::click_and_drag()).on_hover_text("Resize Timeline View");
-    if let Some(pos) = slider.interact_pointer_pos()
-        && (slider.dragged() || slider.clicked())
-    {
-        let t = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
-        ed.cell_w = MIN_CELL_W + t * (MAX_CELL_W - MIN_CELL_W);
-    }
-    p.circle_filled(knob, 6.0, theme::PANEL_BG);
-    p.circle_stroke(knob, 5.0, Stroke::new(2.0, Color32::from_rgb(0xE0, 0xE0, 0xE0)));
-    let reset = button_at(ui, pos2(track.left() - 18.0, cy), Icon::TlResetZoom, "Reset Timeline Zoom To The Default Level", false, true, false);
-    if reset.clicked() {
-        ed.cell_w = DEFAULT_CELL_W;
+    if gone < 1 {
+        let right = bar.right() - 12.0;
+        icons::paint(&p, Rect::from_center_size(pos2(right - 9.0, cy), vec2(16.0, 12.0)), Icon::TlMountains, ICON_INK);
+        let track = Rect::from_min_max(pos2(right - 104.0, cy - 1.0), pos2(right - 24.0, cy + 1.0));
+        p.rect_filled(track, 1.0, theme::SLIDER_TRACK);
+        let t = (ed.cell_w - MIN_CELL_W) / (MAX_CELL_W - MIN_CELL_W);
+        let knob = pos2(track.left() + t * track.width(), cy);
+        let slider = ui.interact(track.expand2(vec2(6.0, 8.0)), ui.id().with("cell-width"), Sense::click_and_drag()).on_hover_text("Resize Timeline View");
+        if let Some(pos) = slider.interact_pointer_pos()
+            && (slider.dragged() || slider.clicked())
+        {
+            let t = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
+            ed.cell_w = MIN_CELL_W + t * (MAX_CELL_W - MIN_CELL_W);
+        }
+        p.circle_filled(knob, 6.0, theme::PANEL_BG);
+        p.circle_stroke(knob, 5.0, Stroke::new(2.0, Color32::from_rgb(0xE0, 0xE0, 0xE0)));
+        let reset = button_at(ui, pos2(track.left() - 18.0, cy), Icon::TlResetZoom, "Reset Timeline Zoom To The Default Level", false, true, false);
+        if reset.clicked() {
+            ed.cell_w = DEFAULT_CELL_W;
+        }
     }
 
     if let Some(action) = action {
@@ -606,10 +646,14 @@ fn keep_selection(ed: &mut Editor) {
     ed.tl.sel_at = Some(sel_key(ed));
 }
 
-/// Keeps the selection to where it was made (see `State::sel_at`).
+/// Keeps the selection to where it was made (see `State::sel_at`). Another
+/// scene or symbol starts scrolled to its playhead, with no loop range.
 fn sync(ed: &mut Editor) {
     let key = sel_key(ed);
     if ed.tl.sel_at.as_ref() != Some(&key) {
+        if ed.tl.sel_at.as_ref().is_some_and(|k| (k.1, &k.2) != (key.1, &key.2)) {
+            (ed.tl.loop_range, ed.center_frame) = (None, true);
+        }
         ed.tl.sel = Cells::from([(ed.layer, ed.frame)]);
         ed.tl.anchor = (ed.layer, ed.frame);
         ed.tl.sel_at = Some(key);
@@ -785,9 +829,19 @@ fn reorder(ed: &mut Editor, gap: usize) {
     ed.checkpoint();
     pin_colors(ed.timeline_mut());
     ed.timeline_mut().move_layers(&moving, gap);
-    let row = |l: usize| moving.iter().position(|&m| m == l).map(|i| to + i);
+    // Where each layer went: the moved ones from `to` on, the rest closing up around them.
+    let row = |l: usize| {
+        let rest = l - moving.iter().filter(|&&m| m < l).count();
+        Some(match moving.iter().position(|&m| m == l) {
+            Some(i) => to + i,
+            None if rest < to => rest,
+            None => rest + moving.len(),
+        })
+    };
     let cells: Cells = ed.tl.sel.iter().filter_map(|&(l, f)| Some((row(l)?, f))).collect();
     let active = row(ed.layer).unwrap_or(to);
+    ed.tl.anchor.0 = row(ed.tl.anchor.0).unwrap_or(to);
+    ed.follow_layers(row);
     select(ed, cells, (active, ed.frame));
 }
 
@@ -806,17 +860,22 @@ pub fn available(ed: &Editor, action: Action) -> bool {
         CreateClassicTween => keys(&|k, f, n| k.index < f + n && k.index + k.duration > f && k.tween == Tween::None),
         RemoveTween => keys(&|k, f, n| k.index < f + n && k.index + k.duration > f && k.tween != Tween::None),
         ClearKeyframe => keys(&|k, f, n| k.index > 0 && (f..f + n).contains(&k.index)),
-        PasteFrames | PasteOverwriteFrames => ed.tl.clip.is_some(),
+        PasteFrames | PasteOverwriteFrames => ed.tl.clip.as_ref().is_some_and(|(rows, _)| !nests(ed, rows.iter().flatten())),
         ReverseFrames => !runs.is_empty() && runs.iter().all(|&(l, f, n)| layers[l].can_reverse(f, n)),
         PrevKeyframe => keyframe_neighbors(ed).0.is_some(),
         NextKeyframe => keyframe_neighbors(ed).1.is_some(),
         DeleteLayer | CutLayers | LockOthers | HideOthers => selected_layers(ed).len() < layers.len(),
         CopyLayers | DuplicateLayers | LayerProperties => !selected_layers(ed).is_empty(),
-        PasteLayers => !ed.tl.layer_clip.is_empty(),
+        PasteLayers => !ed.tl.layer_clip.is_empty() && !nests(ed, ed.tl.layer_clip.iter().flat_map(|l| &l.frames)),
         ShowAllLayers => layers.iter().any(|l| !l.visible() || l.locked()),
         ToggleGuide => layers.get(ed.layer).is_some_and(|l| matches!(l.kind, LayerKind::Normal | LayerKind::Guide)),
         _ => true,
     }
+}
+
+/// Whether pasting `frames` here would put the symbol being edited inside itself.
+fn nests<'a>(ed: &'a Editor, frames: impl IntoIterator<Item = &'a Frame>) -> bool {
+    ed.editing.last().is_some_and(|t| symbols::draws(&ed.doc, frames.into_iter().flat_map(|k| &k.elements), &t.symbol))
 }
 
 /// Runs a timeline command on the selected frames or layers.
@@ -849,6 +908,7 @@ pub fn command(ed: &mut Editor, action: Action) {
             let at = tl.insert_folder(at, &format!("Folder_{n}"));
             tl.layers[at].set_color(color);
             ed.layer = at;
+            ed.follow_layers(|l| Some(if l < at { l } else { l + 1 }));
         }
         Action::DeleteLayer => delete_layers(ed),
         Action::CopyLayers | Action::CutLayers => {
@@ -872,7 +932,8 @@ pub fn command(ed: &mut Editor, action: Action) {
             let count = new.len();
             let tl = ed.timeline_mut();
             pin_colors(tl);
-            tl.insert_layers(at, new);
+            let at = tl.insert_layers(at, new);
+            ed.follow_layers(|l| Some(if l < at { l } else { l + count }));
             let cells = (at..at + count).flat_map(|l| layer_cells(ed, l)).collect();
             select(ed, cells, (at, ed.frame));
         }
@@ -1024,14 +1085,15 @@ fn delete_layers(ed: &mut Editor) {
     pin_colors(ed.timeline_mut());
     ed.timeline_mut().remove_layers(&doomed);
     ed.layer = doomed[0].min(ed.timeline().layers.len() - 1);
-    ed.prune_selection();
+    ed.follow_layers(|l| (!doomed.contains(&l)).then(|| l - doomed.iter().filter(|&&d| d < l).count()));
 }
 
-/// The loop range, first and last frame, within the timeline.
+/// The loop range, first and last frame, within the timeline. A range left
+/// past its end (frames removed since) is the whole timeline again.
 pub fn loop_range(ed: &Editor) -> (u32, u32) {
     let last = ed.frame_count() - 1;
-    let (a, b) = ed.tl.loop_range.unwrap_or((0, last));
-    (a.min(last), b.min(last).max(a.min(last)))
+    let (a, b) = ed.tl.loop_range.filter(|&(a, _)| a <= last).unwrap_or((0, last));
+    (a, b.min(last).max(a))
 }
 
 /// The frames the onion skin can show: first and last.
@@ -1129,6 +1191,7 @@ fn grid(ui: &mut Ui, ed: &mut Editor) {
     let thumbs = scrollbars(ui, ed, id, frames, names, shown, max_layer);
     let geo = Geo::new(ed, frames, rows_top);
     let mods = ui.input(|i| i.modifiers);
+    let idle = ed.tl.drag.is_none();
     let row_at = |p: Pos2| {
         let r = geo.row_at(p.y).floor();
         (r >= 0.0 && (r as usize) < count).then_some(r as usize)
@@ -1202,6 +1265,10 @@ fn grid(ui: &mut Ui, ed: &mut Editor) {
             }
             _ => {}
         }
+    }
+    // A gesture starting now holds on to the document as it is.
+    if idle {
+        ed.tl.drag_on = (ed.rev, ed.scene);
     }
     track(ui, ed, geo);
     // A click in the loop strip moves the playhead too, as anywhere on the ruler.
@@ -1284,6 +1351,12 @@ fn grid(ui: &mut Ui, ed: &mut Editor) {
 /// Follows the pointer while a gesture's button is down, and finishes the gesture when it comes up.
 fn track(ui: &Ui, ed: &mut Editor, geo: Geo) {
     let Some(drag) = ed.tl.drag else { return };
+    // A key that changed the document or the scene mid-gesture (Ctrl+Z, Shift+F5, End) ends it:
+    // the layers, frames or loop range it holds on to may be gone. Toggles change it themselves.
+    if ed.tl.drag_on != (ed.rev, ed.scene) && !matches!(drag, Drag::Toggle(..)) {
+        ed.tl.drag = None;
+        return;
+    }
     let (pos, down) = ui.input(|i| (i.pointer.interact_pos(), i.pointer.primary_down()));
     let count = ed.timeline().layers.len();
     if let Some(pos) = pos {
@@ -1479,9 +1552,11 @@ fn paint(ui: &Ui, ed: &Editor, rect: Rect, geo: Geo, thumbs: [Option<Rect>; 2]) 
             p.text(pos2(x + 2.0, tier + 5.0), Align2::LEFT_TOP, number.to_string(), FontId::proportional(11.0), theme::RULER_TEXT);
         }
     }
-    for y in [ruler.top() + 0.5, tier, ruler.bottom() - 0.5] {
+    for y in [ruler.top() + 0.5, tier] {
         p.hline(ruler.x_range(), y, hairline);
     }
+    // The bottom line runs under the layer header too.
+    p.hline(rect.x_range(), ruler.bottom() - 0.5, hairline);
     let (lo, hi) = onion_range(ed);
     if ed.onion && lo <= hi {
         // The onion-skin range, lightened between its two markers.
@@ -1494,7 +1569,7 @@ fn paint(ui: &Ui, ed: &Editor, rect: Rect, geo: Geo, thumbs: [Option<Rect>; 2]) 
     let layers = &ed.timeline().layers;
     let sel = &ed.tl.sel;
     let selected_rows = selected_layers(ed);
-    let rows_area = Rect::from_min_max(pos2(rect.left(), rows_top + 1.0), rect.max);
+    let rows_area = Rect::from_min_max(pos2(rect.left(), rows_top), rect.max);
     let p = p.with_clip_rect(rows_area);
     let hovered_row = hover.filter(|h| h.y >= rows_top).map(|h| geo.row_at(h.y).floor() as usize);
     for (i, layer) in layers.iter().enumerate() {
@@ -1542,12 +1617,15 @@ fn paint(ui: &Ui, ed: &Editor, rect: Rect, geo: Geo, thumbs: [Option<Rect>; 2]) 
             }
         }
 
-        // Empty cells, with every 5th column lighter (not on folder rows); selected ones blue.
+        // Empty cells, with every 5th column lighter (not on folder rows); selected
+        // ones blue (spans get theirs in `spans`). Each cell's first pixel column
+        // (under the ruler's tick) and each row's last pixel row is a line, drawn
+        // over the cell's own fill where the next fill can't reach it.
         let folder = layer.kind == LayerKind::Folder;
         let is_selected = |f: u32| !folder && sel.contains(&(i, f));
         for f in first..first + visible {
             let x = x_of(f);
-            let fill = if is_selected(f) {
+            let fill = if is_selected(f) && layer.keyframe_at(f).is_none() {
                 theme::FRAME_SELECTED
             } else if (f + 1) % 5 == 0 && !folder {
                 theme::FRAME_CELL_5TH
@@ -1555,12 +1633,12 @@ fn paint(ui: &Ui, ed: &Editor, rect: Rect, geo: Geo, thumbs: [Option<Rect>; 2]) 
                 theme::FRAME_CELL
             };
             p.rect_filled(Rect::from_min_size(pos2(x, top), vec2(cell_w, row_h)), 0.0, fill);
-            p.vline(x + cell_w, top..=top + row_h, hairline);
+            p.vline(x, top..=top + row_h, hairline);
         }
         if !folder {
             spans(&p, layer, first, visible, top, geo, &is_selected);
         }
-        p.hline(rect.x_range(), top + row_h, hairline);
+        p.hline(rect.x_range(), top + row_h - 0.5, hairline);
     }
 
     // What a drag will do: the block's new place, a span's new end, or where layers land.
@@ -1867,7 +1945,7 @@ fn layer_properties(ctx: &egui::Context, ed: &mut Editor) {
                 ui.end_row();
             });
             ui.with_layout(Layout::top_down(Align::Max), |ui| {
-                ok |= ui.button("    OK    ").clicked();
+                ok |= theme::cta_button(ui, "    OK    ").clicked();
                 cancel |= ui.button("  Cancel  ").clicked();
             });
         });
@@ -1875,18 +1953,25 @@ fn layer_properties(ctx: &egui::Context, ed: &mut Editor) {
     if modal.should_close() || cancel {
         ed.tl.props = None;
     } else if ok && let Some(d) = ed.tl.props.take() {
-        ed.checkpoint();
-        if let Some(l) = ed.timeline_mut().layers.get_mut(d.layer) {
-            let name = d.name.trim();
-            if !name.is_empty() {
-                l.name = name.to_string();
+        // OK with nothing changed is no undo step.
+        let sel = ed.selection.clone();
+        ed.edit_timeline(|_, tl| {
+            if let Some(l) = tl.layers.get_mut(d.layer) {
+                let name = d.name.trim();
+                if !name.is_empty() {
+                    l.name = name.to_string();
+                }
+                l.kind = d.kind;
+                l.set_visible(d.visible);
+                l.set_locked(d.locked);
+                l.set_outline(d.outline);
+                // An untouched colour isn't written in, which would be a change.
+                if d.color != layer_color(l, d.layer) {
+                    l.set_color(crate::app::rgba(d.color));
+                }
             }
-            l.kind = d.kind;
-            l.set_visible(d.visible);
-            l.set_locked(d.locked);
-            l.set_outline(d.outline);
-            l.set_color(crate::app::rgba(d.color));
-        }
+            sel
+        });
     }
 }
 

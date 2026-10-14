@@ -1165,6 +1165,16 @@ mod tests {
     }
 
     #[test]
+    fn the_columns_start_a_pixel_under_the_app_bar() {
+        // The window's 1 px line under the app bar, then the columns (docs/animate-ui.md
+        // §4.1): Selection at T+35 (§6.2); Back under the document tabs, centered in the
+        // 30 px edit bar (§4.4).
+        let h = blank();
+        assert_eq!(h.get_by_role_and_label(Role::Button, "Selection Tool").rect().top(), theme::APP_BAR_H + 35.0);
+        assert_eq!(h.get_by_label("Back").rect().top(), theme::APP_BAR_H + 1.0 + theme::DOC_TABS_H + 3.0);
+    }
+
+    #[test]
     fn the_drawer_adds_moves_and_removes_buttons() {
         let mut t = Toolbar::default();
         assert_eq!(t.sections.iter().map(Vec::len).collect::<Vec<_>>(), [3, 5, 5, 2]);

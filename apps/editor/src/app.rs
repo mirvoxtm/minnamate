@@ -11,7 +11,7 @@ use eframe::egui::{
 use minnamate_core::doc::{Document, Element, LayerKind, Matrix, Paint, Point, Rgba, Shape, Timeline};
 use minnamate_core::hit::{self, ElementRef};
 use minnamate_core::render::render_timeline;
-use minnamate_core::{arrange, draw, swf_export, transform, xfl, xfl_write};
+use minnamate_core::{arrange, draw, swf_export, symbols, transform, xfl, xfl_write};
 
 use crate::icons::Icon;
 use crate::tools::Tool;
@@ -35,6 +35,8 @@ pub enum Action {
     /// Opens what New Document's Create or a Home tile asked for.
     CreateDocument,
     Open,
+    /// Opens the file dropped on the window.
+    OpenDropped,
     Close,
     /// Modify > Document: the Document Settings dialog.
     DocumentSettings,
@@ -191,6 +193,10 @@ pub struct EditTarget {
     pub isolated: bool,
 }
 
+/// An undo or redo step: the document, what was selected in it, and in which
+/// timeline: its scene, by place and name, and the symbols being edited.
+type Step = (Document, Vec<ElementRef>, (usize, String, Vec<String>));
+
 /// The timeline being edited, borrowing only what it needs so callers can
 /// change other fields at the same time.
 fn timeline_of<'a>(doc: &'a Document, scene: usize, editing: &[EditTarget]) -> &'a Timeline {
@@ -329,6 +335,8 @@ pub struct Editor {
     pub layer_rows: Rect,
     /// A command waiting on "Save changes before closing?".
     pub confirm: Option<Action>,
+    /// The file dropped on the window, for `Action::OpenDropped`.
+    dropped: Option<PathBuf>,
     /// Set while running a command the user agreed may drop unsaved changes.
     discard_ok: bool,
     /// The window may close: unsaved changes were dealt with.
@@ -352,8 +360,8 @@ pub struct Editor {
     /// Unsaved changes since the document was opened.
     pub dirty: bool,
     /// Undo and redo steps: the document, what was selected in it, and the scene it was in.
-    undo: Vec<(Document, Vec<ElementRef>, usize)>,
-    redo: Vec<(Document, Vec<ElementRef>, usize)>,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
     /// The field a run of edits came from (one drag = one undo step).
     gesture: Option<&'static str>,
     /// The widget with the keyboard as the gesture began: Escape there undoes it.
@@ -448,6 +456,7 @@ impl Editor {
             tl: Default::default(),
             layer_rows: Rect::NOTHING,
             confirm: None,
+            dropped: None,
             discard_ok: false,
             closing: false,
             editing: Vec::new(),
@@ -568,7 +577,7 @@ impl Editor {
         if self.undo.len() == UNDO_LEVELS {
             self.undo.remove(0);
         }
-        self.undo.push((self.doc.clone(), self.selection.clone(), self.scene));
+        self.undo.push((self.doc.clone(), self.selection.clone(), self.place()));
         self.redo.clear();
         self.gesture = None;
         self.dirty = true;
@@ -592,17 +601,40 @@ impl Editor {
     }
 
     fn undo(&mut self) {
-        if let Some((doc, selection, scene)) = self.undo.pop() {
-            self.redo.push((std::mem::replace(&mut self.doc, doc), std::mem::replace(&mut self.selection, selection), self.scene));
-            self.after_history(scene);
+        if let Some(step) = self.undo.pop() {
+            let back = self.swap(step);
+            self.redo.push(back);
         }
     }
 
     fn redo(&mut self) {
-        if let Some((doc, selection, scene)) = self.redo.pop() {
-            self.undo.push((std::mem::replace(&mut self.doc, doc), std::mem::replace(&mut self.selection, selection), self.scene));
-            self.after_history(scene);
+        if let Some(step) = self.redo.pop() {
+            let back = self.swap(step);
+            self.undo.push(back);
         }
+    }
+
+    /// The timeline being edited, as an undo step names it: the scene's index and
+    /// name, and the symbols being edited in it.
+    fn place(&self) -> (usize, String, Vec<String>) {
+        let name = self.doc.scenes.get(self.scene).map(|s| s.name.clone()).unwrap_or_default();
+        (self.scene, name, self.editing.iter().map(|t| t.symbol.clone()).collect())
+    }
+
+    /// Undo and redo: puts `step` in, returning what it replaced. The scene shown
+    /// stays while it exists; one the step removes gives way to the scene the step
+    /// was made in. The step's selection comes back only to the timeline it was made in.
+    fn swap(&mut self, (doc, selection, at): Step) -> Step {
+        let here = self.place();
+        let back = (std::mem::replace(&mut self.doc, doc), std::mem::take(&mut self.selection), here.clone());
+        let scene = self.doc.scenes.iter().position(|s| s.name == here.1).unwrap_or(at.0);
+        self.after_history(scene);
+        let now = self.place();
+        if (&now.1, &now.2) == (&at.1, &at.2) {
+            self.selection = selection;
+            self.prune_selection();
+        }
+        back
     }
 
     /// Keeps the state valid after undo or redo swapped the document and selection,
@@ -623,13 +655,27 @@ impl Editor {
         self.prune_selection();
     }
 
-    /// Drops selected elements that no longer exist or aren't on the current frame.
+    /// Drops selected elements that no longer exist, aren't on the current
+    /// frame, or are on a layer since hidden or locked, where the stage can't select.
     pub fn prune_selection(&mut self) {
         let (layers, f) = (&timeline_of(&self.doc, self.scene, &self.editing).layers, self.frame);
         self.selection.retain(|r| {
-            let key = layers.get(r.layer).and_then(|l| l.frames.get(r.keyframe));
+            let key = layers.get(r.layer).filter(|l| l.visible() && !l.locked()).and_then(|l| l.frames.get(r.keyframe));
             key.is_some_and(|k| (k.index..k.index + k.duration).contains(&f) && r.element < k.elements.len())
         });
+    }
+
+    /// After layers were added, removed or moved: the selection stays on its
+    /// elements, `row(l)` being where layer `l` went (None: removed).
+    pub fn follow_layers(&mut self, row: impl Fn(usize) -> Option<usize>) {
+        self.selection = self.selection.iter().filter_map(|&r| Some(ElementRef { layer: row(r.layer)?, ..r })).collect();
+    }
+
+    /// Whether drawing and pasting can land on the active layer: a normal or
+    /// guide layer, shown and unlocked.
+    pub fn drawable(&self) -> bool {
+        let layer = self.timeline().layers.get(self.layer);
+        layer.is_some_and(|l| matches!(l.kind, LayerKind::Normal | LayerKind::Guide) && l.visible() && !l.locked())
     }
 
     pub fn element(&self, r: ElementRef) -> Option<&Element> {
@@ -689,8 +735,11 @@ impl Editor {
                 }
             }
             Action::PasteInCenter | Action::PasteInPlace if !self.clipboard.is_empty() => {
-                if !self.pasteable_layer() {
+                if !self.drawable() {
                     return self.log("Pasting needs a normal layer, shown and unlocked: select one in the timeline.");
+                }
+                if self.editing.last().is_some_and(|t| symbols::draws(&self.doc, &self.clipboard, &t.symbol)) {
+                    return self.log("Pasting that here would put a symbol inside itself.");
                 }
                 let center = (action == Action::PasteInCenter).then(|| self.view_center());
                 let items = self.clipboard.clone();
@@ -771,13 +820,6 @@ impl Editor {
         }
     }
 
-    /// Whether pasted elements can go on the active layer: a normal or guide
-    /// layer, shown and unlocked.
-    pub fn pasteable_layer(&self) -> bool {
-        let layer = self.timeline().layers.get(self.layer);
-        layer.is_some_and(|l| matches!(l.kind, LayerKind::Normal | LayerKind::Guide) && l.visible() && !l.locked())
-    }
-
     /// The middle of the stage view, in the edited timeline's coordinates.
     fn view_center(&self) -> Point {
         let c = vec2(self.doc.width, self.doc.height) / 2.0 - self.pan / self.zoom;
@@ -808,10 +850,8 @@ impl Editor {
     /// keyframe showing there, or a new blank keyframe past the layer's end.
     pub fn add_shape(&mut self, mut shape: Shape) {
         let (l, f) = (self.layer, self.frame);
-        let Some(layer) = self.timeline().layers.get(l) else { return };
-        if !matches!(layer.kind, LayerKind::Normal | LayerKind::Guide) {
-            self.log("Drawing needs a normal layer: select one in the timeline.");
-            return;
+        if !self.drawable() {
+            return self.log("Drawing needs a normal layer, shown and unlocked: select one in the timeline.");
         }
         // Only the drawing tools add shapes, and a Pen path may end after another tool is picked.
         // ponytail: raw shapes don't merge here yet, so on stage both modes look alike; the file tells them apart.
@@ -947,7 +987,8 @@ impl Editor {
     /// Double-click on an instance, or Edit Symbols: edit that symbol in place,
     /// with the rest of the stage dimmed behind it.
     pub fn enter_symbol(&mut self, r: ElementRef) {
-        let Some(Element::Instance(inst)) = self.element_mut(r).map(|el| el.clone()) else { return };
+        // Where it shows now: part way along a classic tween, say.
+        let Some(inst) = stage::shown_instance(self, r) else { return };
         if !self.doc.library.contains_key(&inst.symbol) {
             return;
         }
@@ -1014,7 +1055,9 @@ impl Editor {
         crate::pen::finish(self, false);
         crate::text_tool::commit(self);
         if let Some(t) = self.editing.pop() {
-            (self.frame, self.layer, self.playing) = (t.frame, t.layer, None);
+            // Its layer may have gone since, by an undo made inside.
+            let layer = t.layer.min(self.timeline().layers.len().saturating_sub(1));
+            (self.frame, self.layer, self.playing) = (t.frame, layer, None);
             self.selection.clear();
             self.rev += 1;
         }
@@ -1100,6 +1143,7 @@ impl Editor {
         let at = tl.insert_layer(at, &name);
         tl.layers[at].set_color(color);
         self.layer = at;
+        self.follow_layers(|l| Some(if l < at { l } else { l + 1 }));
     }
 
     /// Window menu: a hidden panel opens on its tab; a visible one closes,
@@ -1184,7 +1228,7 @@ impl Editor {
             return;
         }
         // Commands that drop the open document first ask about unsaved changes.
-        let discards = matches!(action, Action::CreateDocument | Action::Open | Action::OpenRecent(_) | Action::Close | Action::Exit);
+        let discards = matches!(action, Action::CreateDocument | Action::Open | Action::OpenDropped | Action::OpenRecent(_) | Action::Close | Action::Exit);
         if discards && self.dirty && !self.discard_ok {
             self.confirm = Some(action);
             return;
@@ -1195,6 +1239,11 @@ impl Editor {
             Action::New => crate::home::open_new(self, 0, 0),
             Action::CreateDocument => crate::home::create_pending(self),
             Action::Open => self.open_dialog(),
+            Action::OpenDropped => {
+                if let Some(path) = self.dropped.take() {
+                    self.open(path);
+                }
+            }
             Action::Close => crate::home::close(self),
             Action::DocumentSettings => crate::home::open_settings(self),
             Action::ExportSwf => self.export_swf(),
@@ -1354,7 +1403,7 @@ impl Editor {
     /// Ctrl+Shift+D (greyed) doesn't reach Ctrl+D.
     fn shortcuts(&mut self, ctx: &egui::Context) {
         // Dialogs keep the keyboard (Enter, Escape) while up.
-        if self.home.dialog_open() || ctx.memory(|m| m.top_modal_layer()).is_some() {
+        if self.dialog_up(ctx) {
             return;
         }
         let mut all = menu::shortcuts();
@@ -1442,10 +1491,21 @@ impl Editor {
         }
     }
 
+    /// A dialog is up, and keeps the window's input.
+    fn dialog_up(&self, ctx: &egui::Context) -> bool {
+        self.home.dialog_open() || ctx.memory(|m| m.top_modal_layer()).is_some()
+    }
+
+    /// A file dropped on the window opens as File > Open would: asking about
+    /// unsaved changes first, and not while a dialog is up (a native one takes no drops).
     fn dropped_files(&mut self, ctx: &egui::Context) {
+        if self.dialog_up(ctx) {
+            return;
+        }
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
         if let Some(path) = dropped.into_iter().next() {
-            self.open(path);
+            self.dropped = Some(path);
+            self.run(Action::OpenDropped, ctx);
         }
     }
 
@@ -1498,20 +1558,22 @@ impl Editor {
         id
     }
 
-    /// One layer of the scene at `frame`, recolored toward `tint` when given.
-    /// Onion skinning draws layer by layer, so a layer's ghosts sit under its own
-    /// current content but over the layers below it, as in Animate.
+    /// One layer of the timeline being edited at `frame`, where it shows on
+    /// stage, recolored toward `tint` when given. Onion skinning draws layer by
+    /// layer, so a layer's ghosts sit under its own current content but over the
+    /// layers below it, as in Animate.
     pub fn layer_texture(&mut self, ctx: &egui::Context, layer: usize, frame: u32, tint: Option<Color32>, vp: &ViewPort) -> Option<egui::TextureId> {
         // Keep only the frames the onion skin can show, and the current one.
         let (lo, hi) = timeline::onion_range(self);
         let now = self.frame;
         self.onion_cache.retain(|(_, f, _), _| (lo..=hi).contains(f) || *f == now);
-        let key = hash((self.rev, vp.bits()));
-        let doc = &self.doc;
-        let scene = &doc.scenes[self.scene];
-        let one = Timeline { name: scene.name.clone(), layers: vec![scene.layers.get(layer)?.clone()], extra: Default::default() };
+        // Entering or leaving a symbol changes `rev`; another scene doesn't.
+        let key = hash((self.rev, self.scene, vp.bits()));
+        let (doc, tl) = (&self.doc, timeline_of(&self.doc, self.scene, &self.editing));
+        let matrix = vp.matrix * self.editing.last().map_or(Matrix::IDENTITY, |t| t.transform);
+        let one = Timeline { name: tl.name.clone(), layers: vec![tl.layers.get(layer)?.clone()], extra: Default::default() };
         cached(ctx, &mut self.onion_cache, (layer, frame, tint.map(|c| c.to_array())), key, || {
-            let (mut pixmap, _) = render_timeline(doc, &one, frame, &vp.matrix, vp.size, 1.0).ok()?;
+            let (mut pixmap, _) = render_timeline(doc, &one, frame, &matrix, vp.size, 1.0).ok()?;
             if let Some(tint) = tint {
                 // Mostly the tint, with a little of the original color left showing.
                 for px in pixmap.data_mut().chunks_exact_mut(4) {
@@ -1568,7 +1630,7 @@ impl Editor {
                     if ui.button("  Don't Save  ").clicked() {
                         answer = Some(Answer::DontSave);
                     }
-                    if ui.button("    Save    ").clicked() {
+                    if theme::cta_button(ui, "    Save    ").clicked() {
                         answer = Some(Answer::Save);
                     }
                     answer
@@ -1587,7 +1649,7 @@ impl Editor {
                 ui.add_space(6.0);
                 ui.label(message);
                 ui.add_space(10.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| ui.button("   OK   ").clicked()).inner
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| theme::cta_button(ui, "   OK   ").clicked()).inner
             });
             if modal.inner || modal.should_close() {
                 self.error = None;
@@ -1608,7 +1670,7 @@ impl Editor {
                     });
                 });
                 ui.add_space(8.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| ui.button("   OK   ").clicked()).inner
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| theme::cta_button(ui, "   OK   ").clicked()).inner
             });
             if modal.inner || modal.should_close() {
                 self.about = false;
@@ -1677,27 +1739,28 @@ impl eframe::App for Editor {
             .frame(Frame::NONE.fill(theme::BAR))
             .show_separator_line(false)
             .show(ui, |ui| menu::app_bar(ui, self));
+        // Under the app bar the window's frame shows as a 1 px line (docs/animate-ui.md §4.1).
         if self.show_tools && !self.home.shown {
-            let width = tools::width(self, ui.available_height() - gap as f32);
+            let width = tools::width(self, ui.available_height() - 1.0);
             // A 1 px line of the window's frame shows along the column's outer edge.
             let panel = egui::Panel::left("tools").exact_size(1.0 + width + gap as f32).resizable(false).show_separator_line(false);
-            panel.frame(theme::dock_frame(1, gap, gap)).show(ui, |ui| tools::panel(ui, self));
+            panel.frame(theme::dock_frame(1, gap, 1)).show(ui, |ui| tools::panel(ui, self));
         }
         if self.show_right && !self.home.shown {
             let panel = egui::Panel::right("properties").default_size(300.0).size_range(250.0..=640.0).show_separator_line(false);
-            panel.frame(theme::dock_frame(gap, 0, gap)).show(ui, |ui| {
+            panel.frame(theme::dock_frame(gap, 0, 1)).show(ui, |ui| {
                 theme::dock_strip(ui, Icon::ChevronsRight);
                 panels::right(ui, self);
             });
             // Collapsed panels, as icons, just left of Properties.
             let strip = egui::Panel::right("panel-icons").exact_size(36.0 + gap as f32).resizable(false).show_separator_line(false);
-            strip.frame(theme::dock_frame(gap, 0, gap)).show(ui, |ui| {
+            strip.frame(theme::dock_frame(gap, 0, 1)).show(ui, |ui| {
                 theme::dock_strip(ui, Icon::ChevronsLeft);
                 panels::icon_strip(ui, self);
             });
         }
         // The document column: tabs, edit bar and stage, with the Timeline under them.
-        egui::CentralPanel::default().frame(Frame::NONE.outer_margin(egui::Margin { top: gap, ..Default::default() })).show(ui, |ui| {
+        egui::CentralPanel::default().frame(Frame::NONE.outer_margin(egui::Margin { top: 1, ..Default::default() })).show(ui, |ui| {
             // Home takes the place of the whole workspace below the app bar.
             if self.home.shown {
                 return crate::home::screen(ui, self);
@@ -1851,6 +1914,22 @@ pub(crate) mod testkit {
         screen_drag(h, a, b, mods);
     }
 
+    /// Drops the file at `path` on the window, as from Explorer.
+    pub fn drop_file(h: &mut Harness<'_, Editor>, path: PathBuf) {
+        #[derive(Debug)]
+        struct Dropped(PathBuf);
+        impl egui::DroppedFile for Dropped {
+            fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+            fn bytes(&self) -> Result<Vec<u8>, String> {
+                std::fs::read(&self.0).map_err(|e| e.to_string())
+            }
+        }
+        h.input_mut().dropped_files.push(std::sync::Arc::new(Dropped(path)));
+        h.step();
+    }
+
     /// The box around everything on stage at the current frame.
     pub fn shape_bounds(ed: &Editor) -> hit::Rect {
         let all = ed.all_elements();
@@ -1864,6 +1943,29 @@ pub(crate) mod testkit {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/screenshots");
         std::fs::create_dir_all(&dir).unwrap();
         image.save(dir.join(format!("{name}.png"))).unwrap();
+    }
+
+    /// The window as rendered, to read pixels from as `image[(x, y)]`. Needs a
+    /// renderer; the pointer, if over the window, is drawn too.
+    pub fn rendered(h: &mut Harness<'_, Editor>) -> ColorImage {
+        let image = h.render().expect("render");
+        ColorImage::from_rgba_unmultiplied([image.width() as usize, image.height() as usize], image.as_raw())
+    }
+
+    /// The texts painted last frame, each with the part of it that shows.
+    pub fn painted_texts(h: &Harness<'_, Editor>) -> Vec<(String, Rect)> {
+        fn walk(shape: &egui::Shape, clip: Rect, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.visual_bounding_rect().intersect(clip))),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, clip, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in &h.output().shapes {
+            walk(&c.shape, c.clip_rect, &mut out);
+        }
+        out
     }
 }
 
@@ -2463,6 +2565,237 @@ mod tests {
         screenshot(&mut h, "arrange_panels");
     }
 
+    /// However narrow the Timeline, its toolbar draws no control over another
+    /// or past the panel: the zoom controls, the readouts and then cluster
+    /// groups give way, and Play stays (docs/animate-ui.md §5.2).
+    #[test]
+    fn a_narrow_timeline_toolbar_gives_way_instead_of_overlapping() {
+        use egui_kittest::kittest::Queryable;
+        const FIRST: &str = "Go to Previous Keyframe (Alt+,)";
+        const LAST: &str = "Step forward one frame (.)";
+        let buttons = [
+            "New Layer", "Add/Remove Camera", "Show Parenting View", "Layer Depth", FIRST, "Insert Keyframe (hold for more)",
+            "Go to Next Keyframe (Alt+.)", "Onion Skin (hold for more)", "Edit Multiple Frames", "Create Classic Tween", "Center Frame",
+            "Loop", "Step back one frame (,)", "Play (Enter)", LAST, "Reset Timeline Zoom To The Default Level",
+        ];
+        let mut h = harness(false);
+        for size in [vec2(1600.0, 900.0), vec2(1366.0, 768.0), vec2(1280.0, 800.0), vec2(960.0, 600.0)] {
+            h.set_size(size);
+            h.run();
+            let (rows, width) = (h.state().layer_rows, h.state().view_size.x);
+            let (panel, frames) = (rows.left()..=rows.left() + width, rows.right()..=rows.left() + width);
+            let shown: Vec<(&str, Rect)> = buttons.iter().filter_map(|&b| h.query_by_label(b).map(|n| (b, n.rect()))).collect();
+            // The readouts: what's painted in the toolbar row, over the frames.
+            let bar = rows.top() - 33.0 - 34.0..=rows.top() - 33.0;
+            let texts: Vec<Rect> = painted_texts(&h).into_iter().map(|(_, r)| r).filter(|r| r.is_positive() && bar.contains(&r.center().y) && frames.contains(&r.left())).collect();
+            assert!(shown.iter().any(|(b, _)| *b == "Play (Enter)"), "{size:?}: Play is gone");
+            for (i, &(a, ra)) in shown.iter().enumerate() {
+                assert!(panel.contains(&ra.left()) && panel.contains(&ra.right()), "{size:?}: {a} is off the panel");
+                for &(b, rb) in &shown[i + 1..] {
+                    assert!(!ra.shrink(0.5).intersects(rb.shrink(0.5)), "{size:?}: {a} is on {b}");
+                }
+                for t in &texts {
+                    assert!(!ra.intersects(*t), "{size:?}: {a} is on a readout");
+                }
+            }
+            if size.x == 1600.0 {
+                assert_eq!(shown.len(), buttons.len(), "all fit at full width");
+                let middle = (shown[4].1.left() + shown[14].1.right()) / 2.0;
+                assert!((middle - (frames.start() + frames.end()) / 2.0).abs() <= 1.0, "the cluster is centered over the frames");
+                assert_eq!((shown[4].0, shown[14].0), (FIRST, LAST));
+            }
+        }
+    }
+
+    /// Panel tabs: the active label #F3F3F3, the others #818181 (docs/animate-ui.md §4.6).
+    #[test]
+    #[ignore = "needs a GPU adapter; run with --ignored"]
+    fn panel_tabs_dim_all_but_the_active_label() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = harness(true);
+        h.run();
+        let image = rendered(&mut h);
+        let brightest = |label: &str| {
+            let r = h.get_by_label(label).rect();
+            let xs = r.left() as usize..r.right() as usize;
+            (r.top() as usize..r.bottom() as usize).flat_map(|y| xs.clone().map(move |x| (x, y))).map(|p| image[p].r()).max().unwrap()
+        };
+        for label in ["Library", "Assets", "Output"] {
+            assert!((0x70..=0x86).contains(&brightest(label)), "{label}: {:#X}", brightest(label));
+        }
+        for label in ["Properties", "Timeline"] {
+            assert!(brightest(label) >= 0xF0, "{label}: {:#X}", brightest(label));
+        }
+    }
+
+    /// The frame grid's 1 px #252525 lines (docs/animate-ui.md §5.4, §5.6):
+    /// between empty frames, between rows in the grid and in the layer list,
+    /// and under the layer header. Selected frames over a span stay half blue
+    /// up to them.
+    #[test]
+    #[ignore = "needs a GPU adapter; run with --ignored"]
+    fn frame_grid_lines_show() {
+        let mut h = harness(true);
+        h.run();
+        drag_cells(&mut h, (0, 2), (2, 6), egui::Modifiers::NONE);
+        h.remove_cursor();
+        h.run();
+        let image = rendered(&mut h);
+        let ed = h.state();
+        let (rows, row) = (ed.layer_rows, ed.tl.row_h);
+        let x_of = |f: f32| rows.right() + (f - ed.first_visible_frame) * ed.cell_w;
+        let line = Color32::from_gray(0x25);
+        let px = |x: f32, y: f32| image[(x as usize, y as usize)];
+        // Frame 21 is empty on every layer.
+        let (x, edge) = (x_of(21.0), rows.top() + row);
+        assert!([x - 1.0, x].iter().any(|&x| px(x, rows.top() + row / 2.0) == line), "between frames");
+        for x in [x_of(20.5), rows.left() + 150.0] {
+            assert!([edge - 1.0, edge].iter().any(|&y| px(x, y) == line), "between rows at x {x}");
+        }
+        assert_eq!(px(rows.left() + 150.0, rows.top() - 1.0), line, "under the layer header");
+        assert_ne!(px(rows.left() + 150.0, rows.top()), theme::FRAME_CELL, "the first row starts under it");
+        for y in [edge - 1.0, edge] {
+            assert_ne!(px(x_of(4.5), y), theme::FRAME_SELECTED, "a selected span's edge at y {y}");
+        }
+    }
+
+    /// The edit bar's small glyphs come out at about their color, not faded:
+    /// the menu buttons' carets (text_dim) and the zoom steps (text).
+    #[test]
+    #[ignore = "needs a GPU adapter; run with --ignored"]
+    fn small_chrome_glyphs_are_not_faint() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = harness(true);
+        h.run();
+        let image = rendered(&mut h);
+        let brightest = |r: Rect| {
+            let xs = r.left() as usize..r.right() as usize;
+            (r.top() as usize..r.bottom() as usize).flat_map(|y| xs.clone().map(move |x| (x, y))).map(|p| image[p].r()).max().unwrap()
+        };
+        for label in ["Edit Scene", "Edit Symbols"] {
+            let button = h.get_by_label(label).rect();
+            let caret = Rect::from_min_max(egui::pos2(button.left() + 19.0, button.top()), button.max);
+            assert!(brightest(caret) >= 0x88, "{label}'s caret: {:#X}", brightest(caret));
+        }
+        for label in ["Zoom in", "Zoom out"] {
+            let glyph = brightest(h.get_by_label(label).rect());
+            assert!(glyph >= 0xC8, "{label}: {glyph:#X}");
+        }
+    }
+
+    /// Separators in the dark popovers are #3F3F3F, to show on #1E1E1E
+    /// (docs/animate-ui.md §4.2 item 7).
+    #[test]
+    #[ignore = "needs a GPU adapter; run with --ignored"]
+    fn dark_popover_separators_show() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = harness(true);
+        h.run();
+        h.get_by_label("Workspaces").click();
+        h.run();
+        let label = h.get_by_label("New Workspace").rect();
+        h.remove_cursor();
+        h.run();
+        let image = rendered(&mut h);
+        // Between the last workspace and "New Workspace".
+        let x = label.center().x as usize;
+        let brightest = (label.top() as usize - 12..label.top() as usize).map(|y| image[(x, y)].r()).max().unwrap();
+        assert!(brightest >= 0x3A, "{brightest:#X}");
+    }
+
+    /// A menu's button keeps its pressed fill while the menu is open, wherever
+    /// the pointer goes (docs/animate-ui.md §6.5, §4.2).
+    #[test]
+    #[ignore = "needs a GPU adapter; run with --ignored"]
+    fn menu_buttons_stay_pressed_while_their_menu_is_open() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = harness(true);
+        h.run();
+        for (label, secondary) in [("Edit Scene", false), ("Insert Keyframe (hold for more)", true), ("Workspaces", false)] {
+            let rect = {
+                let button = h.get_by_label(label);
+                if secondary { button.click_secondary() } else { button.click() }
+                button.rect()
+            };
+            h.run();
+            h.remove_cursor();
+            h.run();
+            let image = rendered(&mut h);
+            assert_eq!(image[(rect.left() as usize + 2, rect.center().y as usize)], theme::BUTTON_ACTIVE, "{label}");
+            // A click on the pasteboard closes it.
+            screen_click(&mut h, egui::pos2(300.0, 590.0), egui::Modifiers::NONE);
+            h.run();
+        }
+    }
+
+    /// A dialog's OK button is the blue call to action (docs/animate-ui.md §4.7).
+    #[test]
+    #[ignore = "needs a GPU adapter; run with --ignored"]
+    fn dialog_ok_buttons_are_blue() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = harness(true);
+        h.run();
+        let ctx = h.ctx.clone();
+        let dialogs: [(&str, fn(&mut Editor, &egui::Context)); 3] = [
+            ("    OK    ", |ed, ctx| ed.run(Action::LayerProperties, ctx)),
+            ("    OK    ", |ed, _| {
+                ed.selection = vec![ElementRef { layer: 1, keyframe: 0, element: 0 }];
+                crate::convert_symbol::open(ed);
+            }),
+            ("    Save    ", |ed, _| (ed.dirty, ed.confirm) = (true, Some(Action::Close))),
+        ];
+        for (label, open) in dialogs {
+            open(h.state_mut(), &ctx);
+            h.run();
+            let rect = h.get_by_label(label).rect();
+            let image = rendered(&mut h);
+            assert_eq!(image[(rect.left() as usize + 3, rect.center().y as usize)], theme::CTA, "{label}");
+            h.key_press(Key::Escape);
+            h.run();
+        }
+    }
+
+    /// Properties > Object names a raw shape "Shape" and an Object Drawing one
+    /// "Drawing Object" (docs/animate-ui.md §7.2.4).
+    #[test]
+    fn the_object_tab_tells_a_shape_from_a_drawing_object() {
+        use egui_kittest::kittest::Queryable;
+        for (object_drawing, name) in [(false, "Shape"), (true, "Drawing Object")] {
+            let mut h = blank();
+            (h.state_mut().object_drawing, h.state_mut().tool) = (object_drawing, Tool::Rectangle);
+            mouse_drag(&mut h, (100.0, 100.0), (200.0, 150.0));
+            h.state_mut().tool = Tool::Selection;
+            mouse_click(&mut h, (150.0, 125.0));
+            h.state_mut().props_tab = PropsTab::Object;
+            h.run();
+            assert_eq!(h.state().selection.len(), 1);
+            assert!(h.query_by_label(name).is_some(), "{name}");
+        }
+    }
+
+    /// Every panel menu opens and ends with Lock, Help, Close and Close Group,
+    /// Properties' group and the icon strip's flyouts included (docs/animate-ui.md §4.6).
+    #[test]
+    fn every_panel_menu_opens() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = harness(false);
+        h.run();
+        h.get_by_label("Properties panel menu").click();
+        h.run();
+        assert!(h.query_by_label("Lock").is_some());
+        h.get_by_label("Close Group").click();
+        h.run();
+        assert!(!h.state().show_right);
+        let ctx = h.ctx.clone();
+        h.state_mut().run(Action::Show(PanelId::Align), &ctx);
+        h.run();
+        h.get_by_label("Align panel menu").click();
+        h.run();
+        h.get_by_label("Close").click();
+        h.run();
+        assert!(h.state().flyout.is_none());
+    }
+
     /// The blank document with rectangles drawn from (x0, y0) to (x1, y1), in order,
     /// and the Selection tool picked.
     fn rectangles(boxes: &[(f32, f32, f32, f32)]) -> Harness<'static, Editor> {
@@ -2784,8 +3117,6 @@ mod tests {
     }
 
     #[test]
-    // ponytail: the new Properties number fields commit on Escape instead of reverting; fix, then un-ignore.
-    #[ignore = "known gap: Escape in the new Properties number fields"]
     fn escape_cancels_the_field_and_leaves_the_stage_be() {
         use egui::{Event, Key};
         use egui_kittest::kittest::Queryable;
@@ -2814,7 +3145,6 @@ mod tests {
         h.state_mut().props_tab = PropsTab::Object;
         h.run();
         let x = selected_bounds(h.state()).min.0;
-        let shown = format!("{x:.2}");
         h.get_by_label("X").click();
         h.run();
         h.event(Event::Text("300".into()));
@@ -3101,7 +3431,7 @@ mod tests {
         ed.run(Action::Undo, &ctx);
         assert_eq!((names(ed), ed.scene), (vec!["Scene 1".to_string(), "Scene 2".into()], 0));
         ed.run(Action::Redo, &ctx);
-        assert_eq!(ed.scene, 1, "redo goes back to Scene 3");
+        assert_eq!((names(ed), ed.scene), (vec!["Scene 1".to_string(), "Scene 3".into(), "Scene 2".into()], 0), "redo keeps the scene shown");
     }
 
     #[test]
@@ -3119,4 +3449,389 @@ mod tests {
         let ed = h.state();
         assert!(ed.show_tools && ed.show_right && ed.show_bottom && ed.panel_shown(PanelId::Align), "F4 again brings them back");
     }
+
+    #[test]
+    fn a_dropped_file_asks_about_unsaved_changes_and_waits_for_dialogs() {
+        let mut h = blank();
+        let ctx = h.ctx.clone();
+        // A dialog up keeps the window's input, drops too: Document Settings stays about its document.
+        h.key_press_modifiers(Modifiers::COMMAND, Key::J);
+        h.run();
+        drop_file(&mut h, fixture());
+        assert_eq!(h.state().title, "Untitled-1");
+        h.key_press(Key::Escape);
+        h.run();
+        // With unsaved changes, a drop asks first, as File > Open does.
+        h.state_mut().tool = Tool::Rectangle;
+        mouse_drag(&mut h, (100.0, 100.0), (200.0, 150.0));
+        drop_file(&mut h, fixture());
+        let ed = h.state();
+        assert_eq!((ed.title.as_str(), ed.all_elements().len(), ed.confirm.is_some()), ("Untitled-1", 1, true));
+        h.state_mut().resolve(Answer::Cancel, &ctx);
+        // While Close asks, a drop waits too, and doesn't take Close's place.
+        h.state_mut().run(Action::Close, &ctx);
+        h.run();
+        drop_file(&mut h, fixture());
+        assert_eq!((h.state().title.as_str(), h.state().confirm), ("Untitled-1", Some(Action::Close)));
+        h.state_mut().resolve(Answer::Cancel, &ctx);
+        h.run();
+        drop_file(&mut h, fixture());
+        h.state_mut().resolve(Answer::DontSave, &ctx);
+        assert_eq!(h.state().title, "tween");
+    }
+
+    #[test]
+    fn moving_and_deleting_layers_keeps_the_stage_selection_on_its_objects() {
+        let selected = |ed: &Editor| ed.selection.iter().map(|&r| ed.timeline().layers[r.layer].name.clone()).collect::<Vec<_>>();
+        // Pressing Blink's name selects its instance; dragged below Ball, it's still Blink's.
+        let mut h = harness(false);
+        h.run();
+        let (rows, row_h) = (h.state().layer_rows, h.state().tl.row_h);
+        let name = |row: f32| egui::pos2(rows.left() + 60.0, rows.top() + row_h * row);
+        screen_drag(&mut h, name(0.5), name(2.1), Modifiers::NONE);
+        let layers: Vec<_> = h.state().timeline().layers.iter().map(|l| l.name.clone()).collect();
+        assert_eq!((layers, selected(h.state())), (vec!["Ball".to_string(), "Blink".into(), "Background".into()], vec!["Blink".to_string()]));
+        h.key_press(Key::Delete);
+        h.step();
+        let ed = h.state();
+        assert!(ed.timeline().layers[1].frames[0].elements.is_empty() && ed.timeline().layers[0].frames[0].elements.len() == 1);
+
+        // Deleting the ball's layer takes its selected instance along; nothing else is selected.
+        let mut h = harness(false);
+        h.run();
+        let ctx = h.ctx.clone();
+        mouse_click(&mut h, (100.0, 200.0));
+        assert_eq!(selected(h.state()), ["Ball"]);
+        h.state_mut().run(Action::DeleteLayer, &ctx);
+        assert!(h.state().selection.is_empty());
+
+        // Duplicate Layers puts the copy above: the original's instance stays selected.
+        let mut h = harness(false);
+        h.run();
+        let ctx = h.ctx.clone();
+        mouse_click(&mut h, (100.0, 200.0));
+        h.state_mut().run(Action::DuplicateLayers, &ctx);
+        let ed = h.state();
+        assert_eq!((ed.timeline().layers[1].name.as_str(), ed.selection.as_slice()), ("Ball copy", &[ElementRef { layer: 2, keyframe: 0, element: 0 }][..]));
+        // New Layer and New Folder go in above the active layer, the copy; it stays the ball.
+        for action in [Action::NewLayer, Action::NewFolder] {
+            h.state_mut().run(action, &ctx);
+        }
+        assert_eq!(selected(h.state()), ["Ball"]);
+    }
+
+    #[test]
+    fn a_key_changing_the_document_mid_drag_ends_the_timeline_gesture() {
+        // Ctrl+dragging the end of the bottom layer's span while Ctrl+Z takes away the layer above.
+        let mut h = harness(false);
+        h.run();
+        let before = keys(h.state());
+        h.state_mut().new_layer();
+        h.run();
+        let (a, b) = (cell(&h, 3, 10), cell(&h, 3, 14));
+        h.event(egui::Event::ModifiersChanged(Modifiers::COMMAND));
+        h.hover_at(a);
+        h.step();
+        h.drag_at(a);
+        h.step();
+        h.hover_at(b);
+        h.step();
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
+        h.step();
+        h.drop_at(b);
+        h.event(egui::Event::ModifiersChanged(Modifiers::NONE));
+        h.step();
+        assert_eq!(keys(h.state()), before);
+
+        // Shift+dragging the loop range while Ctrl+Z takes its frames away.
+        let mut h = blank();
+        h.state_mut().set_frame(14);
+        h.key_press(Key::F5);
+        h.step();
+        let ed = h.state_mut();
+        (ed.loop_playback, ed.tl.loop_range) = (true, Some((10, 14)));
+        h.run();
+        let (rows, cell_w) = (h.state().layer_rows, h.state().cell_w);
+        let strip = |frames: f32| egui::pos2(rows.right() + frames * cell_w, rows.top() - 26.0);
+        h.event(egui::Event::ModifiersChanged(Modifiers::SHIFT));
+        h.hover_at(strip(12.5));
+        h.step();
+        h.drag_at(strip(12.5));
+        h.step();
+        h.event(egui::Event::ModifiersChanged(Modifiers::NONE));
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
+        h.step();
+        h.hover_at(strip(11.5));
+        h.step();
+        h.drop_at(strip(11.5));
+        h.step();
+        assert_eq!((h.state().frame_count(), h.state().tl.loop_range), (1, Some((10, 14))));
+    }
+
+    #[test]
+    fn a_symbol_never_goes_inside_itself() {
+        let mut h = rectangles(&[(100.0, 100.0, 200.0, 150.0)]);
+        let ctx = h.ctx.clone();
+        mouse_click(&mut h, (150.0, 125.0));
+        h.key_press(Key::F8);
+        h.step();
+        h.step();
+        h.key_press(Key::Enter);
+        h.step();
+        // Its instance copied as an element, as frames and as a layer, then pasted into it every way.
+        for action in [Action::Copy, Action::CopyFrames, Action::CopyLayers] {
+            h.state_mut().run(action, &ctx);
+        }
+        let r = h.state().selection[0];
+        h.state_mut().enter_symbol(r);
+        for action in [Action::PasteInPlace, Action::PasteInCenter, Action::PasteFrames, Action::PasteOverwriteFrames, Action::PasteLayers] {
+            h.state_mut().run(action, &ctx);
+        }
+        // No frame is drawn here: two of itself inside would take 2^32 renders of it.
+        let sym = &h.state().doc.library["Symbol 1"].timeline;
+        let mut elements = sym.layers.iter().flat_map(|l| &l.frames).flat_map(|k| &k.elements);
+        assert!(elements.all(|el| matches!(el, Element::Shape(_))), "{sym:?}");
+    }
+
+    #[test]
+    fn locking_or_hiding_a_layer_deselects_its_objects() {
+        let mut h = rectangles(&[(100.0, 100.0, 200.0, 150.0)]);
+        let (rows, row_h) = (h.state().layer_rows, h.state().tl.row_h);
+        // The lock column, then the eye.
+        for dx in [26.0, 51.0] {
+            mouse_click(&mut h, (150.0, 125.0));
+            assert_eq!(h.state().selection.len(), 1);
+            let column = egui::pos2(rows.right() - dx, rows.top() + row_h * 0.5);
+            screen_click(&mut h, column, Modifiers::NONE);
+            assert!(h.state().selection.is_empty(), "column {dx}");
+            h.key_press(Key::Delete);
+            h.step();
+            assert_eq!(h.state().all_elements().len(), 1);
+            screen_click(&mut h, column, Modifiers::NONE);
+        }
+    }
+
+    #[test]
+    fn locked_and_hidden_layers_take_no_drawing_or_paint() {
+        let mut h = rectangles(&[(100.0, 100.0, 200.0, 150.0)]);
+        let top = |h: &Harness<'_, Editor>| h.state().timeline().layers[0].clone();
+        (h.state_mut().fill_color, h.state_mut().stroke_color) = (Color32::RED, Color32::GREEN);
+        for (locked, hidden) in [(true, false), (false, true)] {
+            let layer = &mut h.state_mut().timeline_mut().layers[0];
+            layer.set_locked(locked);
+            layer.set_visible(!hidden);
+            let before = top(&h);
+            for tool in [Tool::Rectangle, Tool::Brush] {
+                h.state_mut().tool = tool;
+                mouse_drag(&mut h, (120.0, 110.0), (180.0, 140.0));
+            }
+            // In the fill, then on the outline.
+            for tool in [Tool::Eraser, Tool::PaintBucket, Tool::InkBottle] {
+                h.state_mut().tool = tool;
+                mouse_click(&mut h, (150.0, 125.0));
+                mouse_click(&mut h, (100.0, 125.0));
+            }
+            h.state_mut().tool = Tool::Text;
+            mouse_click(&mut h, (150.0, 125.0));
+            h.event(egui::Event::Text("a".into()));
+            h.step();
+            h.state_mut().tool = Tool::Selection;
+            h.step();
+            assert!(top(&h) == before, "locked {locked}, hidden {hidden}");
+        }
+
+        // Under a hidden layer's shape, the Paint Bucket fills the shape it can see.
+        h.state_mut().timeline_mut().layers[0].set_visible(true);
+        h.state_mut().new_layer();
+        h.state_mut().tool = Tool::Rectangle;
+        mouse_drag(&mut h, (100.0, 100.0), (200.0, 150.0));
+        h.state_mut().timeline_mut().layers[0].set_visible(false);
+        let hidden = top(&h);
+        (h.state_mut().tool, h.state_mut().fill_color) = (Tool::PaintBucket, Color32::BLUE);
+        mouse_click(&mut h, (150.0, 125.0));
+        assert!(top(&h) == hidden);
+        let Some(Element::Shape(s)) = h.state().timeline().layers[1].frames[0].elements.first() else { panic!("a shape") };
+        assert!(s.fills.contains(&Paint::Solid(rgba(Color32::BLUE))), "{:?}", s.fills);
+    }
+
+    #[test]
+    fn undo_brings_a_selection_back_only_to_its_own_timeline() {
+        // A nudge in Scene 1, undone from Scene 2: Scene 2's rectangle doesn't get selected.
+        let mut h = rectangles(&[(100.0, 100.0, 200.0, 150.0)]);
+        let ctx = h.ctx.clone();
+        h.state_mut().run(Action::InsertScene, &ctx);
+        h.state_mut().tool = Tool::Rectangle;
+        mouse_drag(&mut h, (100.0, 100.0), (200.0, 150.0));
+        h.state_mut().tool = Tool::Selection;
+        h.state_mut().run(Action::GoToScene(Go::First), &ctx);
+        h.run();
+        mouse_click(&mut h, (150.0, 125.0));
+        h.key_press(Key::ArrowRight);
+        h.step();
+        h.state_mut().run(Action::GoToScene(Go::Last), &ctx);
+        h.run();
+        h.state_mut().run(Action::Undo, &ctx);
+        assert!(h.state().selection.is_empty());
+        h.key_press(Key::Delete);
+        h.step();
+        assert_eq!(h.state().doc.scenes[1].layers[0].frames[0].elements.len(), 1);
+
+        // A nudge inside a symbol, undone from the scene: the scene's instance doesn't either.
+        let mut h = rectangles(&[(100.0, 100.0, 200.0, 150.0)]);
+        let ctx = h.ctx.clone();
+        mouse_click(&mut h, (150.0, 125.0));
+        h.key_press(Key::F8);
+        h.step();
+        h.step();
+        h.key_press(Key::Enter);
+        h.step();
+        let r = h.state().selection[0];
+        h.state_mut().enter_symbol(r);
+        mouse_click(&mut h, (150.0, 125.0));
+        h.key_press(Key::ArrowRight);
+        h.step();
+        h.state_mut().exit_symbol();
+        h.state_mut().run(Action::Undo, &ctx);
+        assert!(h.state().selection.is_empty());
+
+        // Undoing Insert Scene from a later scene stays on that scene.
+        let mut h = blank();
+        let ctx = h.ctx.clone();
+        for go in [Action::InsertScene, Action::InsertScene, Action::GoToScene(Go::First), Action::InsertScene, Action::GoToScene(Go::To(2))] {
+            h.state_mut().run(go, &ctx);
+        }
+        assert_eq!(h.state().doc.scenes[h.state().scene].name, "Scene 2");
+        h.state_mut().run(Action::Undo, &ctx);
+        let ed = h.state();
+        assert_eq!((ed.doc.scenes.len(), ed.doc.scenes[ed.scene].name.as_str()), (3, "Scene 2"));
+    }
+
+    #[test]
+    fn edit_in_place_opens_a_tweened_instance_where_it_shows() {
+        let mut h = harness(false);
+        h.run();
+        let ctx = h.ctx.clone();
+        // Frame 6: the ball is halfway along its tween, at (250, 200).
+        h.state_mut().set_frame(5);
+        h.run();
+        mouse_click(&mut h, (250.0, 200.0));
+        h.state_mut().run(Action::EditInPlace, &ctx);
+        let m = h.state().editing[0].transform;
+        assert!((m.tx - 250.0).abs() < 0.01 && (m.ty - 200.0).abs() < 0.01, "{m:?}");
+    }
+
+    #[test]
+    fn leaving_a_symbol_after_its_parent_lost_layers() {
+        let mut h = rectangles(&[(100.0, 100.0, 200.0, 150.0)]);
+        let ctx = h.ctx.clone();
+        mouse_click(&mut h, (150.0, 125.0));
+        h.key_press(Key::F8);
+        h.step();
+        h.step();
+        h.key_press(Key::Enter);
+        h.step();
+        // Two layers above the instance's, which is then row 2; inside it, undo takes them away.
+        h.state_mut().new_layer();
+        h.state_mut().new_layer();
+        // Long enough after the last click that this isn't a double-click.
+        h.run_steps(40);
+        mouse_click(&mut h, (150.0, 125.0));
+        assert_eq!(h.state().layer, 2);
+        h.state_mut().run(Action::EditInPlace, &ctx);
+        h.state_mut().run(Action::Undo, &ctx);
+        h.state_mut().run(Action::Undo, &ctx);
+        h.state_mut().exit_symbol();
+        assert_eq!((h.state().timeline().layers.len(), h.state().layer), (1, 0));
+        h.state_mut().tool = Tool::Rectangle;
+        mouse_drag(&mut h, (300.0, 200.0), (350.0, 250.0));
+        assert_eq!(h.state().all_elements().len(), 2);
+    }
+
+    #[test]
+    fn each_scene_plays_its_own_loop() {
+        let mut h = blank();
+        let ctx = h.ctx.clone();
+        // Scene 1: 30 frames, looping frames 21 to 26.
+        h.state_mut().set_frame(29);
+        h.key_press(Key::F5);
+        h.step();
+        let ed = h.state_mut();
+        (ed.loop_playback, ed.tl.loop_range) = (true, Some((20, 25)));
+        h.run();
+        // Scene 2, 40 frames: Scene 1's range doesn't come along.
+        h.state_mut().run(Action::InsertScene, &ctx);
+        for last in [9, 39] {
+            h.state_mut().set_frame(last);
+            h.key_press(Key::F5);
+            h.step();
+        }
+        h.run();
+        assert_eq!((h.state().frame_count(), timeline::loop_range(h.state())), (40, (0, 39)));
+        // Undo takes it back to 10 frames, past a range of its own: playback loops them all
+        // rather than sticking on the last.
+        h.state_mut().tl.loop_range = Some((30, 35));
+        h.state_mut().run(Action::Undo, &ctx);
+        h.run();
+        assert_eq!((h.state().frame_count(), timeline::loop_range(h.state())), (10, (0, 9)));
+        let ed = h.state_mut();
+        ed.playing = Some((ctx.input(|i| i.time) - 14.5 / 24.0, 0));
+        ed.tick(&ctx);
+        assert_eq!((h.state().frame, h.state().playing.is_some()), (4, true));
+    }
+
+    #[test]
+    fn entering_and_leaving_a_symbol_scrolls_the_timeline_to_the_playhead() {
+        let mut h = harness(false);
+        h.run();
+        let ctx = h.ctx.clone();
+        h.state_mut().set_frame(5);
+        h.state_mut().first_visible_frame = 300.0;
+        h.run();
+        mouse_click(&mut h, (250.0, 200.0));
+        h.state_mut().run(Action::EditInPlace, &ctx);
+        h.run();
+        assert_eq!(h.state().first_visible_frame, 0.0, "the symbol's frame 1");
+        h.state_mut().first_visible_frame = 300.0;
+        h.state_mut().exit_symbol();
+        h.run();
+        assert!(h.state().first_visible_frame <= 5.0, "the scene's frame 6: {}", h.state().first_visible_frame);
+    }
+
+    #[test]
+    fn show_all_inside_a_symbol_fits_the_symbol() {
+        let mut h = rectangles(&[(100.0, 100.0, 200.0, 150.0)]);
+        let ctx = h.ctx.clone();
+        // A new symbol, edited on its own with its origin at the stage's middle: a box from (0, 0) to (100, 50).
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F8);
+        h.step();
+        h.step();
+        h.key_press(Key::Enter);
+        h.step();
+        h.state_mut().tool = Tool::Rectangle;
+        mouse_drag(&mut h, (275.0, 200.0), (375.0, 250.0));
+        h.state_mut().run(Action::ShowAll, &ctx);
+        // The box's middle, (325, 225) on stage, comes to the view's.
+        let ed = h.state();
+        assert!((ed.pan - vec2(-50.0, -25.0) * ed.zoom).length() < ed.zoom, "{:?} at {}", ed.pan, ed.zoom);
+    }
+
+    #[test]
+    fn commands_that_change_nothing_leave_no_undo_step() {
+        let mut h = harness(false);
+        h.run();
+        let ctx = h.ctx.clone();
+        h.state_mut().run(Action::LayerProperties, &ctx);
+        h.run();
+        h.key_press(Key::Enter);
+        h.run();
+        assert!(!h.state().can_undo() && !h.state().dirty, "Layer Properties, OK with nothing changed");
+        // Lock Others twice: the second finds them locked.
+        h.state_mut().run(Action::LockOthers, &ctx);
+        h.state_mut().run(Action::LockOthers, &ctx);
+        // Remove Frames past every layer's end.
+        h.state_mut().set_frame(40);
+        h.state_mut().run(Action::RemoveFrames, &ctx);
+        assert_eq!(h.state().undo.len(), 1);
+    }
 }
+

@@ -26,9 +26,10 @@ pub const GROUP_DIVIDER: Color32 = rgb(0x545454);
 pub const OUTLINE: Color32 = rgb(0x4F4F4F);
 /// Outlines of popups and floating windows.
 pub const POPUP_BORDER: Color32 = rgb(0x5A5A5A);
-/// Our own dark popups (tool flyouts, tool-option menus, the app bar's popovers), and their hovered rows.
+/// Our own dark popups (tool flyouts, tool-option menus, the app bar's popovers), their hovered rows and separators.
 pub const POPUP_BG: Color32 = rgb(0x1E1E1E);
 pub const POPUP_HOVER: Color32 = rgb(0x2C2C2C);
+pub const POPUP_SEPARATOR: Color32 = rgb(0x3F3F3F);
 /// The check mark in dark popups, on a flyout's current tool.
 pub const ACCENT_HOVER: Color32 = rgb(0x378EF0);
 pub const TEXT: Color32 = rgb(0xEBEBEB);
@@ -81,8 +82,12 @@ pub const FRAME_SELECTED: Color32 = rgb(0x5A8AD0);
 /// Box around selected objects on the stage (every object type, until Highlight
 /// color preferences exist).
 pub const SELECTION_BOX: Color32 = rgb(0x3FA9F5);
-/// The marquee and the lasso: 1 px black, as the spec reads Animate (§1.0).
+/// The marquee and the lasso: 1 px black, as the spec reads Animate (§1.0),
+/// on a 3 px light rim of our own so they show on the dark pasteboard too.
+// ponytail: §7.1 check 4 (Animate 24 on the pasteboard) is still open; redo this after it.
 pub const MARQUEE: Color32 = rgb(0x000000);
+/// White at 160/255, premultiplied.
+pub const MARQUEE_RIM: Color32 = Color32::from_rgba_premultiplied(160, 160, 160, 160);
 /// Scrollbar thumbs: 7 px pills with no visible track.
 pub const SCROLLBAR_THUMB: Color32 = rgb(0xD1D1D1);
 /// Ruler guides: green by default; the hex is a placeholder.
@@ -294,7 +299,14 @@ pub fn menu_check(ui: &Ui, item: &Response) {
 /// clicked inside, so it can hold fields and pages.
 pub fn dark_popup(button: &Response) -> egui::Popup<'_> {
     let frame = Frame::popup(&button.ctx.global_style()).fill(POPUP_BG).stroke(Stroke::new(1.0, POPUP_BORDER));
-    egui::Popup::menu(button).frame(frame).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+    egui::Popup::menu(button).frame(frame).style(dark_popup_style).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+}
+
+/// A dark popover's style: egui's menu style, with the dark-menu style's
+/// #3F3F3F separators (docs/animate-ui.md §4.2 item 7).
+fn dark_popup_style(style: &mut egui::Style) {
+    egui::containers::menu::menu_style(style);
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, POPUP_SEPARATOR);
 }
 
 /// A dark popover's row, 24 high: hover fill, the label, and a blue check
@@ -348,10 +360,15 @@ pub fn tab_strip_menu(ui: &mut Ui, tabs: &[&str], active: usize, menu: Option<im
     let mut x = rect.left();
     // An empty label is a panel closed out of its dock: no tab.
     for (i, label) in tabs.iter().enumerate().filter(|(_, label)| !label.is_empty()) {
+        // Uncolored, so `painter.galley` paints it in the tab's color.
         let font = if i == active { semibold(12.0) } else { FontId::proportional(12.0) };
-        let galley = painter.layout_no_wrap(label.to_string(), font, TEXT);
+        let galley = painter.layout_no_wrap(label.to_string(), font, Color32::PLACEHOLDER);
         let tab = egui::Rect::from_min_size(egui::pos2(x, rect.top()), vec2(galley.size().x + 22.0, TAB_STRIP_H));
         let resp = ui.interact(tab, ui.id().with(("tab", label)), Sense::click());
+        // A lone tab (a flyout's) is a title, not a choice.
+        if tabs.len() > 1 {
+            resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, i == active, *label));
+        }
         if i == active {
             painter.rect_filled(tab, 0.0, PANEL_BG);
         }
@@ -391,12 +408,15 @@ pub fn tab_strip_menu(ui: &mut Ui, tabs: &[&str], active: usize, menu: Option<im
 }
 
 /// A flat square button holding a painted glyph, Animate-style: no fill at
-/// rest, a hover fill, and a lighter chip behind the glyph while toggled on.
+/// rest, a hover fill, and a lighter chip behind the glyph while toggled on,
+/// or pressed, or while the menu it opens is open.
 pub fn icon_button(ui: &mut Ui, size: f32, selected: bool, enabled: bool, tooltip: &str, paint: impl FnOnce(&egui::Painter, egui::Rect, Color32)) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), if enabled { Sense::click() } else { Sense::hover() });
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tooltip));
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
     let painter = ui.painter_at(rect);
     let radius = if size < 24.0 { 2.0 } else { 4.0 };
-    if enabled && resp.is_pointer_button_down_on() {
+    if enabled && (resp.is_pointer_button_down_on() || open) {
         painter.rect_filled(rect, radius, BUTTON_ACTIVE);
     } else if selected {
         painter.rect_filled(rect, radius, TOGGLED);
@@ -406,9 +426,22 @@ pub fn icon_button(ui: &mut Ui, size: f32, selected: bool, enabled: bool, toolti
     if resp.has_focus() {
         painter.rect_stroke(rect.expand(1.0), radius, Stroke::new(2.0, ACCENT), StrokeKind::Outside);
     }
-    let color = if !enabled { TEXT_DISABLED } else if selected || resp.hovered() { Color32::WHITE } else { TEXT };
+    let color = if !enabled { TEXT_DISABLED } else if selected || open || resp.hovered() { Color32::WHITE } else { TEXT };
     paint(&painter, rect, color);
     resp.on_hover_text(tooltip)
+}
+
+/// A dialog's main button, OK say: white text on the blue call to action,
+/// darker while hovered and pressed (docs/animate-ui.md §4.7).
+pub fn cta_button(ui: &mut Ui, text: &str) -> Response {
+    ui.scope(|ui| {
+        let w = &mut ui.visuals_mut().widgets;
+        for (state, fill) in [(&mut w.inactive, CTA), (&mut w.hovered, CTA_HOVER), (&mut w.active, CTA_DOWN)] {
+            (state.weak_bg_fill, state.bg_stroke, state.fg_stroke.color) = (fill, Stroke::NONE, Color32::WHITE);
+        }
+        ui.button(text)
+    })
+    .inner
 }
 
 /// A collapsible Properties section, open at first: a 2 px divider, a 32 px

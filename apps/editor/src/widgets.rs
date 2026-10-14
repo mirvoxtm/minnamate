@@ -80,7 +80,9 @@ impl Widget for Number<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
         // A value outside the range (a hair-thin selection's width) shows as it is.
         // Typing commits on Enter or leaving the field, not keystroke by keystroke.
-        let drag = DragValue::new(self.value).range(self.range).speed(self.speed).clamp_existing_to_range(false).suffix(self.suffix).update_while_editing(false);
+        let value = self.value;
+        let before = *value;
+        let drag = DragValue::new(&mut *value).range(self.range).speed(self.speed).clamp_existing_to_range(false).suffix(self.suffix).update_while_editing(false);
         let drag = match self.decimals {
             Some(d) => drag.fixed_decimals(d),
             // Up to two decimals, as needed: 550, 24, 212.95.
@@ -105,6 +107,17 @@ impl Widget for Number<'_> {
                 ui.add(drag)
             })
             .inner;
+        // Escape reverts what was typed. egui reports the lost focus for two frames, and
+        // DragValue commits the typed text on the second, when Escape is no longer down.
+        let mut resp = resp;
+        let escaped = resp.id.with("escaped");
+        if ui.data_mut(|d| d.remove_temp::<bool>(escaped)).is_some() && resp.changed() {
+            *value = before;
+            resp.flags.remove(egui::response::Flags::CHANGED);
+        }
+        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            ui.data_mut(|d| d.insert_temp(escaped, true));
+        }
         if !resp.has_focus() {
             let color = if ui.is_enabled() { theme::FIELD_UNDERLINE } else { theme::BORDER };
             ui.painter().hline(resp.rect.x_range(), resp.rect.bottom() - 1.5, Stroke::new(1.0, color));

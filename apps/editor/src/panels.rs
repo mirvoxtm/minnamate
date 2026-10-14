@@ -265,7 +265,8 @@ fn category_row(ui: &mut Ui, ed: &mut Editor) {
 /// second line (Doc's document type) 56.
 fn header(ui: &mut Ui, icon: Icon, title: &str, subtitle: Option<&str>) {
     let h = if subtitle.is_some() { 56.0 } else { 48.0 };
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, title));
     let p = ui.painter();
     icons::paint(p, Rect::from_center_size(pos2(rect.left() + 26.0, rect.center().y), vec2(20.0, 20.0)), icon, theme::TEXT);
     let x = rect.left() + 46.0;
@@ -1550,7 +1551,8 @@ mod tests {
         h.run();
         assert_eq!(inst(&h).kind, SymbolKind::Graphic);
         assert!(h.query_by_label("Instance Name").is_none(), "graphics have no instance name");
-        assert!(h.query_by_label("Loop").is_some(), "but they loop");
+        // The timeline toolbar has a Loop button too.
+        assert!(h.query_all_by_label("Loop").count() == 2, "but they loop");
     }
 
     #[test]

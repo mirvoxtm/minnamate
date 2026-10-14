@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::display::display_list;
+use crate::display::display_list_shown;
 use crate::doc::*;
 use crate::hit::{self, ElementRef};
 
@@ -21,7 +21,7 @@ pub enum Picked {
 // ponytail: colors come as the shape holds them, before instances' color effects (tint,
 // alpha). Carry display.rs's color transforms through `under` if picking tinted symbols matters.
 pub fn pick(doc: &Document, tl: &Timeline, frame: u32, point: Point, tolerance: f32) -> Option<Picked> {
-    under(doc, tl, frame, point).into_iter().find_map(|(_, s, p, scale)| {
+    under(doc, tl, frame, point, true).into_iter().find_map(|(_, s, p, scale)| {
         let g = Graph::new(s, 0.0);
         Some(match g.seen(s, p, tolerance * scale)? {
             Seen::Stroke(i) => Picked::Stroke(style(&s.strokes, g.pieces[i].styles[STROKE])?.clone()),
@@ -56,7 +56,7 @@ pub fn area_fill(doc: &Document, tl: &Timeline, frame: u32, point: Point, gap: f
 
 /// The shape element `bucket` acts on at `point`, and the face there.
 fn target<'a>(doc: &'a Document, tl: &'a Timeline, frame: u32, point: Point, gap: f32) -> Option<(ElementRef, &'a Shape, Graph, Vec<usize>)> {
-    let found = under(doc, tl, frame, point).into_iter().find_map(|(r, s, p, scale)| {
+    let found = under(doc, tl, frame, point, false).into_iter().find_map(|(r, s, p, scale)| {
         let g = Graph::new(s, gap * scale);
         let face = g.face_at(p)?;
         Some((r, s, g, face))
@@ -69,7 +69,7 @@ fn target<'a>(doc: &'a Document, tl: &'a Timeline, frame: u32, point: Point, gap
 /// Strokes reach `tolerance` past their edges. Returns the element to change and
 /// its new shape; None if nothing changes. Groups and symbols are left alone.
 pub fn ink(doc: &Document, tl: &Timeline, frame: u32, point: Point, tolerance: f32, stroke: Stroke) -> Option<(ElementRef, Shape)> {
-    let found = under(doc, tl, frame, point).into_iter().find_map(|(r, s, p, scale)| {
+    let found = under(doc, tl, frame, point, false).into_iter().find_map(|(r, s, p, scale)| {
         let g = Graph::new(s, 0.0);
         let seen = g.seen(s, p, tolerance * scale)?;
         Some((r, s, g, seen))
@@ -88,10 +88,12 @@ pub fn ink(doc: &Document, tl: &Timeline, frame: u32, point: Point, tolerance: f
 
 /// The shapes drawn at `frame` of `tl`, topmost first: each with the element of
 /// `tl` that put it there, `point` in the shape's coordinates, and how long one
-/// of `tl`'s units is there.
-fn under<'a>(doc: &'a Document, tl: &'a Timeline, frame: u32, point: Point) -> Vec<(ElementRef, &'a Shape, Point, f32)> {
+/// of `tl`'s units is there. Hidden layers draw none; locked ones are passed
+/// over, as the stage can't change them, unless `locked` (the Eyedropper only reads).
+fn under<'a>(doc: &'a Document, tl: &'a Timeline, frame: u32, point: Point, locked: bool) -> Vec<(ElementRef, &'a Shape, Point, f32)> {
     let mut found = Vec::new();
-    for placed in display_list(doc, tl, frame, &mut BTreeSet::new()).iter().rev() {
+    let shown = display_list_shown(doc, tl, frame, &mut BTreeSet::new());
+    for placed in shown.iter().rev().filter(|p| locked || !tl.layers[p.source.layer].locked()) {
         for (s, m) in hit::shapes(doc, &placed.item, placed.matrix, 0).into_iter().rev() {
             // Text hits as its box, which isn't paint.
             let std::borrow::Cow::Borrowed(s) = s else { continue };

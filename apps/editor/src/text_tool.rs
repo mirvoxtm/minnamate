@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use eframe::egui::text::{CCursor, CCursorRange};
 use eframe::egui::{self, Area, Color32, EventFilter, Id, Key, Modifiers, Painter, Rect, Response, Stroke, StrokeKind, Ui, vec2};
-use minnamate_core::doc::{Element, Extra, LayerKind, Matrix, Point, Rgba, Text, TextAlign, TextKind, TextRun};
+use minnamate_core::doc::{Element, Extra, Matrix, Point, Rgba, Text, TextAlign, TextKind, TextRun};
 use minnamate_core::fonts;
 use minnamate_core::hit::ElementRef;
 use minnamate_core::text::{self, Layout};
@@ -227,9 +227,8 @@ fn edit(ed: &mut Editor, r: ElementRef, at: Point) {
 
 /// Starts new text with its box's top left corner at `p`, as wide as its text.
 fn start(ed: &mut Editor, p: Point) {
-    let layer = ed.timeline().layers.get(ed.layer);
-    if !layer.is_some_and(|l| matches!(l.kind, LayerKind::Normal | LayerKind::Guide)) {
-        ed.log("Text needs a normal layer: select one in the timeline.");
+    if !ed.drawable() {
+        ed.log("Text needs a normal layer, shown and unlocked: select one in the timeline.");
         return;
     }
     let text = Text {

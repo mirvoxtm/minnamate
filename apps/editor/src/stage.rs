@@ -209,16 +209,12 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor) {
         }
     }
     let art = if ed.clip_to_stage && !isolated { p.with_clip_rect(stage) } else { p.clone() };
-    if !ed.editing.is_empty() {
-        // Editing a symbol in place: the rest of the stage shows at half strength
-        // over the stage colour, the symbol live on top.
-        if !isolated && let Some(tex) = ed.scene_texture(&ctx, &vp) {
-            art.image(tex, view, uv, Color32::from_white_alpha(128));
-        }
-        if let Some(tex) = ed.symbol_texture(&ctx, &vp) {
-            art.image(tex, view, uv, Color32::WHITE);
-        }
-    } else if ed.onion {
+    // Editing a symbol in place: the rest of the stage shows at half strength
+    // over the stage colour, the symbol live on top.
+    if !ed.editing.is_empty() && !isolated && let Some(tex) = ed.scene_texture(&ctx, &vp) {
+        art.image(tex, view, uv, Color32::from_white_alpha(128));
+    }
+    if ed.onion {
         // Onion skin: earlier frames tinted blue and later ones green, fainter
         // further away, each layer's ghosts under its own current frame.
         for layer in (0..ed.timeline().layers.len()).rev() {
@@ -231,8 +227,11 @@ pub fn panel(ui: &mut Ui, ed: &mut Editor) {
                 art.image(tex, view, uv, Color32::WHITE);
             }
         }
-    } else if let Some(tex) = ed.scene_texture(&ctx, &vp) {
-        art.image(tex, view, uv, Color32::WHITE);
+    } else {
+        let tex = if ed.editing.is_empty() { ed.scene_texture(&ctx, &vp) } else { ed.symbol_texture(&ctx, &vp) };
+        if let Some(tex) = tex {
+            art.image(tex, view, uv, Color32::WHITE);
+        }
     }
     // Animate outlines the stage so its edge shows whatever the colors.
     if !isolated {
@@ -352,7 +351,7 @@ pub fn selectable(ed: &Editor, r: ElementRef) -> bool {
 }
 
 /// A shape drawn in Object Drawing mode: selected, it gets a box, not dots.
-fn drawing_object(s: &Shape) -> bool {
+pub(crate) fn drawing_object(s: &Shape) -> bool {
     s.extra.get("isDrawingObject") == Some("true")
 }
 
@@ -667,7 +666,7 @@ fn dots(ed: &mut Editor, ctx: &egui::Context, vp: &ViewPort) -> Option<egui::Tex
 
 /// Instance `r` as it shows at the current frame: a classic tween moves it
 /// between its keyframes.
-fn shown_instance(ed: &Editor, r: ElementRef) -> Option<Instance> {
+pub(crate) fn shown_instance(ed: &Editor, r: ElementRef) -> Option<Instance> {
     let layer = ed.timeline().layers.get(r.layer)?;
     let key = layer.frames.get(r.keyframe)?;
     let Some(Element::Instance(inst)) = key.elements.get(r.element) else { return None };
@@ -754,7 +753,8 @@ pub(crate) fn transformation_point(p: &Painter, at: Pos2) {
 fn drag_feedback(p: &Painter, ed: &Editor, stage: Rect) {
     let zoom = ed.zoom;
     let to_screen = |q: Point| screen_point(ed, stage, q);
-    let line = Stroke::new(1.0, theme::MARQUEE);
+    // Black on a light rim, so it shows on the pasteboard as on the stage.
+    let lines = [Stroke::new(3.0, theme::MARQUEE_RIM), Stroke::new(1.0, theme::MARQUEE)];
     match &ed.drag {
         Some(Drag::Marquee { start, end }) => {
             // In the edited timeline's coordinates, as it shows on screen (a symbol
@@ -762,7 +762,9 @@ fn drag_feedback(p: &Painter, ed: &Editor, stage: Rect) {
             let ((x0, y0), (x1, y1)) = (*start, *end);
             let ppp = p.ctx().pixels_per_point();
             let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|q| to_screen(q).round_to_pixel_center(ppp));
-            p.add(egui::Shape::closed_line(corners.to_vec(), line));
+            for line in lines {
+                p.add(egui::Shape::closed_line(corners.to_vec(), line));
+            }
         }
         Some(Drag::Stroke { points }) => {
             let pts: Vec<Pos2> = points.iter().map(|&q| to_screen(q)).collect();
@@ -775,7 +777,9 @@ fn drag_feedback(p: &Painter, ed: &Editor, stage: Rect) {
         }
         Some(Drag::Lasso { points }) => {
             let pts: Vec<Pos2> = points.iter().map(|&q| to_screen(q)).collect();
-            p.add(egui::Shape::closed_line(pts, line));
+            for line in lines {
+                p.add(egui::Shape::closed_line(pts.clone(), line));
+            }
         }
         _ => {}
     }
@@ -1034,27 +1038,35 @@ fn ticks(span: egui::Rangef, from: f32, zoom: f32, ppp: f32) -> Vec<(f32, f32, O
         .collect()
 }
 
-/// A flat edit-bar button with a glyph and a small "v": it opens a menu.
+/// A flat edit-bar button with a glyph and a small "v": it opens a menu, and
+/// shows pressed while that's open.
 fn menu_button(ui: &mut Ui, icon: Icon, tooltip: &str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(30.0, 24.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tooltip));
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
     let p = ui.painter_at(rect);
-    if resp.hovered() || egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp)) {
+    if open || resp.is_pointer_button_down_on() {
+        p.rect_filled(rect, 4.0, theme::BUTTON_ACTIVE);
+    } else if resp.hovered() {
         p.rect_filled(rect, 4.0, theme::BUTTON_HOVER);
     }
-    let color = if resp.hovered() { Color32::WHITE } else { theme::TEXT };
+    let color = if open || resp.hovered() { Color32::WHITE } else { theme::TEXT };
     icons::paint(&p, Rect::from_min_size(rect.min + vec2(4.0, 4.0), vec2(16.0, 16.0)), icon, color);
-    icons::paint(&p, Rect::from_min_size(rect.min + vec2(21.0, 9.0), vec2(6.0, 6.0)), Icon::ChevronDown, theme::TEXT_DIM);
+    // A 6 px chevron (docs/animate-ui.md §4.4): the glyph's 14 px box.
+    icons::paint(&p, Rect::from_center_size(rect.min + vec2(24.0, 12.0), vec2(14.0, 14.0)), Icon::ChevronDown, theme::TEXT_DIM);
     resp.on_hover_text(tooltip)
 }
 
 /// A 16 × 24 zoom-step arrow.
 fn step_button(ui: &mut Ui, icon: Icon, enabled: bool, tooltip: &str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(16.0, 24.0), if enabled { Sense::click() } else { Sense::hover() });
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tooltip));
     if enabled && resp.hovered() {
         ui.painter().rect_filled(rect, 2.0, theme::BUTTON_HOVER);
     }
     let color = if !enabled { theme::TEXT_DISABLED } else if resp.hovered() { Color32::WHITE } else { theme::TEXT };
-    icons::paint(ui.painter(), Rect::from_center_size(rect.center(), vec2(10.0, 10.0)), icon, color);
+    // A 14 px box: a 3.5 × 7 px chevron, big enough to show at full strength.
+    icons::paint(ui.painter(), Rect::from_center_size(rect.center(), vec2(14.0, 14.0)), icon, color);
     resp.on_hover_text(tooltip)
 }
 
@@ -1107,30 +1119,13 @@ fn edit_bar(ui: &mut Ui, ed: &mut Editor) {
                 }
             });
             ui.add_space(4.0);
-            // Breadcrumb: the scene, then each symbol being edited, each with its
-            // glyph; clicking one goes back to it.
-            let mut crumbs = vec![(Icon::Scene, ed.doc.scenes[ed.scene].name.clone())];
-            crumbs.extend(ed.editing.iter().map(|t| (symbol_icon(ed, &t.symbol), t.symbol.clone())));
-            let last = crumbs.len() - 1;
-            let mut go_to = None;
-            for (depth, (icon, name)) in crumbs.into_iter().enumerate() {
-                if depth > 0 {
-                    ui.label(RichText::new(">").size(10.0).color(theme::TEXT_DIM));
-                }
-                let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                icons::paint(ui.painter(), r, icon, theme::TEXT_DIM);
-                let text = RichText::new(name).size(12.0).color(if depth == last { Color32::WHITE } else { theme::TEXT });
-                if ui.add(egui::Label::new(text).sense(Sense::click())).clicked() && depth < last {
-                    go_to = Some(depth);
-                }
-            }
-            if let Some(depth) = go_to {
-                while ed.editing.len() > depth {
-                    ed.exit_symbol();
-                }
-            }
-
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            // The right-hand group goes in first, in a child that takes no room
+            // here, so the breadcrumb gets what's left: cut short, and clipped to it.
+            // ponytail: cut from the right, so a deep path hides the current symbol
+            // first; elide the middle crumbs instead if that bites.
+            let mut right = ui.new_child(egui::UiBuilder::new().max_rect(ui.available_rect_before_wrap()).layout(Layout::right_to_left(Align::Center)));
+            {
+                let ui = &mut right;
                 ui.spacing_mut().item_spacing.x = 4.0;
                 zoom_field(ui, ed, &mut action);
                 // Zoom-step arrows walk the presets.
@@ -1157,7 +1152,35 @@ fn edit_bar(ui: &mut Ui, ed: &mut Editor) {
                 }
                 // Disabled until the stage can turn: see local_point.
                 theme::icon_button(ui, 24.0, false, false, "Rotation Tool (Shift+H)", |p, r, c| icons::paint(p, r.shrink(5.0), Icon::StageRotation, c));
+            }
+            let room = Rect::from_x_y_ranges(ui.cursor().left()..=right.min_rect().left() - 8.0, ui.max_rect().y_range());
+            let mut go_to = None;
+            ui.scope(|ui| {
+                ui.set_clip_rect(room.intersect(ui.clip_rect()));
+                ui.set_max_width(room.width().max(0.0));
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                // Breadcrumb: the scene, then each symbol being edited, each with its
+                // glyph; clicking one goes back to it.
+                let mut crumbs = vec![(Icon::Scene, ed.doc.scenes[ed.scene].name.clone())];
+                crumbs.extend(ed.editing.iter().map(|t| (symbol_icon(ed, &t.symbol), t.symbol.clone())));
+                let last = crumbs.len() - 1;
+                for (depth, (icon, name)) in crumbs.into_iter().enumerate() {
+                    if depth > 0 {
+                        ui.label(RichText::new(">").size(10.0).color(theme::TEXT_DIM));
+                    }
+                    let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                    icons::paint(ui.painter(), r, icon, theme::TEXT_DIM);
+                    let text = RichText::new(name).size(12.0).color(if depth == last { Color32::WHITE } else { theme::TEXT });
+                    if ui.add(egui::Label::new(text).sense(Sense::click())).clicked() && depth < last {
+                        go_to = Some(depth);
+                    }
+                }
             });
+            if let Some(depth) = go_to {
+                while ed.editing.len() > depth {
+                    ed.exit_symbol();
+                }
+            }
         });
     });
     let rect = bar.response.rect;
@@ -1507,6 +1530,88 @@ mod tests {
         enter(&mut h);
         h.state_mut().go_to_scene(0);
         assert_eq!((h.state().editing.len(), h.state().frame), (0, 2), "Edit Scene");
+    }
+
+    /// The onion skin draws the scene shown, and the symbol being edited.
+    #[test]
+    #[ignore = "needs a GPU adapter; run with --ignored"]
+    fn onion_skin_in_each_scene_and_symbol() {
+        let pixel = |h: &mut Harness<'static, Editor>, p: Point| {
+            let at = on_stage(h, p) * h.ctx.pixels_per_point();
+            h.render().expect("render").get_pixel(at.x as u32, at.y as u32).0
+        };
+        let mut h = gpu();
+        let ctx = h.ctx.clone();
+        h.state_mut().tool = Tool::Rectangle;
+        mouse_drag(&mut h, (100.0, 100.0), (200.0, 150.0));
+        h.state_mut().run(Action::InsertScene, &ctx);
+        h.state_mut().onion = true;
+        h.run();
+        h.state_mut().run(Action::GoToScene(crate::app::Go::First), &ctx);
+        h.run();
+        assert_eq!(pixel(&mut h, (150.0, 125.0)), [0x00, 0x99, 0xFF, 0xFF], "Scene 1's rectangle, not empty Scene 2");
+
+        // A new symbol, edited on its own, two frames long: from the second, the first shows faintly.
+        h.key_press_modifiers(Modifiers::COMMAND, Key::F8);
+        h.step();
+        h.step();
+        h.key_press(Key::Enter);
+        h.step();
+        mouse_drag(&mut h, (100.0, 250.0), (200.0, 300.0));
+        h.key_press(Key::F7);
+        h.step();
+        mouse_drag(&mut h, (300.0, 250.0), (400.0, 300.0));
+        h.run();
+        assert_eq!((h.state().editing.len(), h.state().frame), (1, 1));
+        assert_ne!(pixel(&mut h, (150.0, 275.0)), [0xFF; 4], "frame 1's rectangle, as a ghost");
+    }
+
+    /// A long breadcrumb is cut short before the edit bar's right-hand group,
+    /// which keeps its room (docs/animate-ui.md §4.4).
+    #[test]
+    fn a_long_breadcrumb_stops_short_of_the_right_group() {
+        use egui_kittest::kittest::Queryable;
+        let mut h = blank();
+        let ed = h.state_mut();
+        for name in ["character_walk_cycle_body", "left_arm_upper_rig"] {
+            minnamate_core::symbols::new_symbol(&mut ed.doc, name, doc::SymbolKind::MovieClip).unwrap();
+        }
+        ed.edit_library_symbol("character_walk_cycle_body");
+        let transform = minnamate_core::doc::Matrix::IDENTITY;
+        ed.editing.push(crate::app::EditTarget { symbol: "left_arm_upper_rig".into(), transform, frame: 0, layer: 0, isolated: true });
+        h.set_size(egui::vec2(960.0, 600.0));
+        h.run();
+        let group = h.get_by_label("Rotation Tool (Shift+H)").rect();
+        for (text, shown) in painted_texts(&h) {
+            if shown.is_positive() && group.y_range().contains(shown.center().y) && shown.left() < group.left() {
+                assert!(shown.right() <= group.left(), "{text:?} runs under the right-hand group");
+            }
+        }
+    }
+
+    /// The marquee shows on the dark pasteboard as well as on the stage: a
+    /// black line with a light rim (docs/animate-ui-interaction.md §1.0).
+    #[test]
+    #[ignore = "needs a GPU adapter; run with --ignored"]
+    fn the_marquee_shows_on_the_pasteboard() {
+        let mut h = gpu();
+        h.state_mut().tool = Tool::Selection;
+        let (a, b) = (on_stage(&h, (-150.0, 100.0)), on_stage(&h, (-30.0, 200.0)));
+        h.hover_at(a);
+        h.step();
+        h.drag_at(a);
+        h.step();
+        h.hover_at(b);
+        h.step();
+        h.step();
+        assert!(matches!(h.state().drag, Some(Drag::Marquee { .. })));
+        let image = rendered(&mut h);
+        // Across its top edge, halfway along.
+        let x = ((a.x + b.x) / 2.0) as usize;
+        let across: Vec<u8> = (a.y as usize - 3..=a.y as usize + 3).map(|y| image[(x, y)].r()).collect();
+        assert!(across.iter().any(|&c| c < 0x10) && across.iter().any(|&c| c >= 0x7A), "{across:X?}");
+        h.drop_at(b);
+        h.step();
     }
 
     /// Writes target/screenshots/stage_selection.png: raw shapes selected (white
