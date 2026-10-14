@@ -1,0 +1,11 @@
+[package]
+name = "minnamate-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "minnamate-cli"
+path = "src/main.rs"
+
+[dependencies]
+minnamate-core = { path = "../../crates/core" }

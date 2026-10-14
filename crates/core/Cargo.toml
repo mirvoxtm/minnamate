@@ -1,0 +1,13 @@
+[package]
+name = "minnamate-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+i_overlay = "9"
+roxmltree = "0.21"
+# Font outlines and metrics; the editor's egui already depends on it.
+skrifa = { version = "0.44", default-features = false, features = ["std"] }
+swf = { version = "0.3", default-features = false, features = ["flate2"] }
+tiny-skia = "0.12"
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }

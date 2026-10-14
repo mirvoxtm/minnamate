@@ -1,0 +1,5 @@
+# Store text with LF endings whatever the checkout's platform.
+* text=auto
+*.png binary
+*.fla binary
+*.swf binary

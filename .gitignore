@@ -1,0 +1,19 @@
+# Build output; the editor's test screenshots land in target/screenshots too.
+/target
+
+# Rendered frames and exported movies; our own art in assets/ is kept.
+*.png
+*.swf
+!assets/**
+
+# Leftovers from applying patches.
+*.orig
+*.rej
+
+# Editors and operating systems.
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
