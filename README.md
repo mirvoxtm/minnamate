@@ -2,7 +2,7 @@
 
 # minnamate
 
-An open-source, clean-room alternative to Adobe Animate, written in Rust. It opens Animate's `.fla` files in an editor laid out like Animate's, and publishes SWF movies that play in Ruffle.
+An open-source, vibecoded clean-room alternative to Adobe Animate, written in Rust. It opens Animate's `.fla` files in an editor laid out like Animate's, and publishes SWF movies that play in Ruffle.
 
 It's early. Expect gaps; the Output panel (F2) lists anything a document uses that minnamate can't show yet.
 
@@ -36,3 +36,6 @@ Both commands take a `.fla` file or an unpacked XFL folder. They print `warning:
 ## Development
 
 Run `cargo test`. Contributors should read the clean-room rules in [CLAUDE.md](CLAUDE.md) first.
+
+## Note
+Minnamate is not something I am proud of due to it's vibecoded nature, but hey, fuck big corpos.
