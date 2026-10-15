@@ -24,14 +24,16 @@ The editor follows Animate's shortcuts: Enter plays, `,` and `.` step frames, F5
 ```sh
 cargo run -p minnamate-cli -- render movie.fla --frame 12 -o frame.png   # one frame as PNG; frames start at 1
 cargo run -p minnamate-cli -- swf movie.fla -o movie.swf                 # SWF, plays in Ruffle
+cargo run -p minnamate-cli -- html5 movie.fla -o movie-web               # HTML5 Canvas page
+cargo run -p minnamate-cli -- gif movie.fla -o movie.gif                 # also: image, png-sequence, video (ffmpeg), publish
 ```
 
-Both commands take a `.fla` file or an unpacked XFL folder. They print `warning: skipped …` for anything they can't handle yet.
+The commands take a `.fla` file or an unpacked XFL folder. They print `warning: skipped …` for anything they can't handle yet.
 
 ## Status
 
-- Works: shapes with solid fills and strokes, groups, graphic symbols, movie clips (in SWF), classic tweens, color effects (alpha, tint, brightness), multiple scenes; in the editor, drawing (rectangle, oval, line, polystar, pencil, brush), selecting and moving, lasso, Convert to Symbol, frame editing, undo, Test Movie.
-- Not yet: masks, gradients and bitmaps, shape and motion tweens, button states beyond Up, ActionScript.
+- Works: shapes with solid, gradient and bitmap fills, groups, symbols (graphic, movie clip, button), classic, motion and shape tweens, masks, guides, layer folders and parenting, filters and blend modes, sound, frame scripts (stop, play, goto, trace...), scenes; publishing to SWF, HTML5 Canvas, GIF, PNG, JPEG and video; in the editor, the drawing tools, selection and transforms, symbols and the Library, the timeline, Actions panel, Publish Settings, undo, Test Movie.
+- Not yet: bones, 3D, Asset Warp, input text, several documents open at once, custom workspaces.
 
 ## Development
 

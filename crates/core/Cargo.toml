@@ -4,10 +4,22 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# zlib for bitmap data (SWF's lossless bitmaps, Animate's bin/*.dat); swf and zip already build it.
+flate2 = "1"
 i_overlay = "9"
+# MP3 decoding and frame walking, pure Rust (a minimp3 port).
+nanomp3 = { version = "0.2", default-features = false, features = ["std"] }
 roxmltree = "0.21"
 # Font outlines and metrics; the editor's egui already depends on it.
 skrifa = { version = "0.44", default-features = false, features = ["std"] }
 swf = { version = "0.3", default-features = false, features = ["flate2"] }
 tiny-skia = "0.12"
+# GIF's LZW: imported GIFs, and the GIF export (encode.rs); already in the lockfile.
+weezl = "0.1"
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# JPEG decoding for imported photos; already in the lockfile.
+zune-jpeg = "0.5"
+
+[dev-dependencies]
+# Decodes the JPEG export back in tests; already in the tree through image.
+zune-core = "0.5"

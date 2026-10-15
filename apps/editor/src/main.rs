@@ -1,8 +1,12 @@
 // Release builds are a GUI app, with no console window on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod actions_panel;
 mod app;
 mod arrange_panels;
+mod audio;
+mod bitmaps;
+mod buttons;
 mod color;
 mod convert_symbol;
 mod cursors;
@@ -18,13 +22,18 @@ mod menu;
 mod paint_tools;
 mod panels;
 mod pen;
+mod publish;
+mod scene_panel;
+mod sound;
 mod stage;
+mod symbol_dialogs;
 mod test_movie;
 mod text_tool;
 mod theme;
 mod timeline;
 mod tools;
 mod tweens;
+mod video;
 mod widgets;
 
 use eframe::egui;
